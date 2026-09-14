@@ -135,38 +135,24 @@ text is the one input with no such guard.
 
 ## The fix
 
-Bug 3 first — it is the smallest change and it removes most of the exposure.
+See **[CONCURRENCY-PLAN.md](CONCURRENCY-PLAN.md)**, which replaces the
+four-part fix that used to be written out here.
 
-`do_check` already restarts a dead session in place:
+The short version of why it is shorter. All four bugs above are ways of losing
+a reference to a live `rocq repl`, or of resolving one to the wrong object, and
+they exist because `Session` is constructed under the table lock
+(`server.py:209`). That puts `flags` and the toolchain -- both fixed at
+construction -- out of reach of any in-place update, so "throw this session
+away" has to be spelled as a table mutation, and the table is the only thing
+holding the process. Move the construction under the per-file lock and it
+becomes a field assignment: the table never changes shape, and a reference that
+never moves cannot be lost.
 
-```python
-with entry.lock:
-    if not entry.sess.alive:
-        entry.sess.start()      # and start() calls stop() first
-```
-
-So "the process died" and "give me a cold one" never needed an `Entry`
-replacement at all. A replacement is only genuinely required when `flags` or
-`toolchain` change, because those are `Session` constructor arguments.
-
-1. Drop the `not entry.sess.alive` clause from `_stale_entry`, and turn
-   `force_cold` and `loaded_changed()` into a restart-in-place flag on the
-   entry that `do_check` honours under `entry.lock`. Concurrent cold checks
-   then share one entry, serialise, and the second replays warm instead of
-   paying a second cold start.
-2. Give `_drop` an identity check — `_drop(key, entry=None)`, popping only if
-   `self.sessions.get(key) is entry` — and pass the entry from `do_check`.
-   Fixes bug 2.
-3. For the flags/toolchain case that still replaces an entry, park the busy
-   one on `self.orphans` and drain it from `_evict` / `_reaper` /
-   `shutdown`, stopping each one whose lock can be taken. Include orphans in
-   `_record_sessions` so a `kill -9`'d daemon does not strand them, and cap
-   the list — past a couple of entries you are in a pathological loop and
-   killing the oldest beats an OOM kill somebody else pays for. Fixes bug 1.
-4. Bug 4: have the server return line and column rather than byte offsets.
-   `render`'s output carries no source snippet, so that removes the client's
-   only use of the file and the race with it. Failing that, return the
-   `digest` the server already computes and let the client warn on a mismatch.
+So the plan is mostly deletion. No orphan list, no cap on it, no draining it
+from three places, no identity-checked `_drop`. It also fixes three further
+findings of the same kind, written up there: the pid file never names the
+session that is running, eviction removes an entry a check is about to use, and
+the global table lock is held across a few hundred `stat` calls.
 
 ## Regression tests
 
