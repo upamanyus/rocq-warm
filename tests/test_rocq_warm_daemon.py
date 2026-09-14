@@ -108,6 +108,55 @@ class DaemonTests(unittest.TestCase):
         self.assertIn(b": nat", edited.stdout)
         self.assertIn(b"replay", edited.stderr)
 
+    def test_a_timed_tactic_reports_its_timing(self):
+        """The canary for what the `Set Silent.` prologue hides, per version.
+
+        `Show`, `Check` and the `Print` family print through
+        `Feedback.msg_notice`, which `Flags.quiet` -- what the prologue sets --
+        has never gated, which is why the test above can assert its output on
+        every 9.x.  `Time`'s "Finished transaction" was never traced to an
+        emitter, so whether the prologue hides it is a question about each
+        Rocq rather than about this tool, and `Time` on a slow tactic is too
+        ordinary a thing to do in a proof being debugged to leave unpinned.
+
+        The property is `coqc`'s, as everything here is: if a batch compile
+        reports a timing, a warm check reports the same timing.  A red leg
+        here means that version's `Set Silent` hides it -- see the prologue's
+        comment in session.py, and DESIGN.md's account of what it gates.
+        Measured present on 9.2.0, where the prologue is inert.
+        """
+        text = GOOD + b"\nLemma timed : True.\nProof.\n  Time exact I.\nQed.\n"
+        self.ws.write(self.NAME, text)
+        _rc, cold = self.ws.coqc(self.NAME)
+        self.assertIn("Finished transaction", cold,
+                      "the reference coqc reported no timing, so there is "
+                      "nothing here to hold the warm session to")
+        got = self.check()
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn(b"Finished transaction", got.stdout,
+                      "coqc reported a timing and the warm session did not")
+
+    def test_an_idtac_message_comes_back(self):
+        """The other message whose channel we could not pin down.
+
+        `idtac "..."` arrives as an `<infomsg>`, i.e. Info level, and Info is
+        where the `if_verbose` messages live -- the ones `Set Silent` does
+        hide on 9.0/9.1 ("foo is defined").  Whether `idtac` is emitted
+        through that gate or around it decides whether a debugging print
+        survives the prologue, and `coqc` prints it, so the same rule applies:
+        if the oracle prints it, a warm check prints it.
+        """
+        text = GOOD + b'\nLemma said : True.\nProof.\n  idtac "IDTAC-MARKER".\n  exact I.\nQed.\n'
+        self.ws.write(self.NAME, text)
+        _rc, cold = self.ws.coqc(self.NAME)
+        self.assertIn("IDTAC-MARKER", cold,
+                      "the reference coqc did not print the idtac message")
+        got = self.check()
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn(b"IDTAC-MARKER", got.stdout,
+                      "coqc printed the idtac message and the warm session "
+                      "did not")
+
     def test_a_bare_show_is_not_a_syntax_error(self):
         """The command you reach for when a proof is stuck, and it used to fail
         the file.
