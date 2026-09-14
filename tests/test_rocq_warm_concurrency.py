@@ -381,7 +381,7 @@ class SlotReturnTests(ServerCase):
         self.assertTrue(self.srv._reclaim(os.path.abspath(self.path)))
         self.assertIsNone(slot.sess)
         self.assertEqual(slot.loaded, {})
-        self.assertEqual(slot.libraries, {})
+        self.assertEqual(slot.library_count, 0)
         self.assertNotIn(os.path.abspath(self.path), self.srv.idle)
 
 

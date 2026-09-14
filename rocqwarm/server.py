@@ -119,11 +119,12 @@ class Slot:
     lock would be a rule in a docstring; being absent from the table you take
     slots from is a fact.
 
-    Nothing on a slot outlives its `rocq repl` -- `loaded` and `libraries`
-    describe what THAT process had loaded, `last_used` only orders live
-    sessions for the LRU, and the flags and toolchain are recomputed from the
-    project on every check.  So a slot with no session is the same thing as no
-    slot, and `Server._return` drops it rather than parking it.
+    Nothing on a slot outlives its `rocq repl` -- `loaded` and
+    `library_count` describe what THAT process had loaded, `last_used` only
+    orders live sessions for the LRU, and the flags and toolchain are
+    recomputed from the project on every check.  So a slot with no session is
+    the same thing as no slot, and `Server._return` drops it rather than
+    parking it.
     """
 
     def __init__(self, path):
@@ -135,7 +136,12 @@ class Slot:
         # .vo path -> (mtime_ns, size) as each was when the session loaded it.
         # Filled in after every check from what Rocq says it has loaded.
         self.loaded = {}
-        self.libraries = {}         # logical name -> .vo path
+        # A count, not the map: the name -> .vo cache that actually saves
+        # work is `Session._libmap`, which is asked once per name per session.
+        # All this is for is `status` showing how the watch set compares with
+        # what Rocq reported, so keeping a few hundred strings to take a
+        # length of would be storing state that looks load-bearing and is not.
+        self.library_count = 0
         self.last_used = time.time()
         self.busy_since = None      # set by _checkout, cleared by _return
         self.deadline = None        # ... and what the check promised to finish by
@@ -182,7 +188,7 @@ class Slot:
         # would hand the next check a `watched` set, and `status` a row, about
         # a session that does not exist.
         self.loaded = {}
-        self.libraries = {}
+        self.library_count = 0
 
 
 class Server:
@@ -571,7 +577,7 @@ class Server:
                 slot.discard()
             else:
                 slot.loaded = {p: pre.get(p, post[p]) for p in post}
-                slot.libraries = libraries
+                slot.library_count = len(libraries)
         finally:
             # Unmissable: a slot that is never given back leaves its file
             # refused for the daemon's life.
@@ -728,7 +734,7 @@ class Server:
                 "idle": now - slot.last_used,
                 "busy": busy_since is not None,
                 "busy_for": None if busy_since is None else now - busy_since,
-                "libraries": len(slot.libraries),
+                "libraries": slot.library_count,
                 "watched": len(slot.loaded),
             })
         resp = {"ok": True, "pid": os.getpid(),
