@@ -144,15 +144,23 @@ they exist because `Session` is constructed under the table lock
 (`server.py:209`). That puts `flags` and the toolchain -- both fixed at
 construction -- out of reach of any in-place update, so "throw this session
 away" has to be spelled as a table mutation, and the table is the only thing
-holding the process. Move the construction under the per-file lock and it
-becomes a field assignment: the table never changes shape, and a reference that
-never moves cannot be lost.
+holding the process.
+
+The plan takes ownership out of the table's hands entirely: a session is
+**checked out** of the table by the thread that wants it, owned outright while
+it is used, and returned afterwards. A file that is already checked out is
+refused, immediately and with a message, rather than queued -- one check per
+file at a time, and no waiting anywhere in the daemon. There is then no
+per-session lock, because a checked-out session is not shared, and the
+dangerous cases stop being cases: eviction cannot take a session out from
+under a check because it only ever looks at the idle table.
 
 So the plan is mostly deletion. No orphan list, no cap on it, no draining it
-from three places, no identity-checked `_drop`. It also fixes three further
-findings of the same kind, written up there: the pid file never names the
-session that is running, eviction removes an entry a check is about to use, and
-the global table lock is held across a few hundred `stat` calls.
+from three places, no identity-checked `_drop`, no `_idle_victim`. It also
+fixes three further findings of the same kind, written up there: the pid file
+never names the session that is running, eviction removes an entry a check is
+about to use, and the global table lock is held across a few hundred `stat`
+calls.
 
 ## Regression tests
 
