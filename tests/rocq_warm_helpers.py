@@ -22,6 +22,14 @@ HAVE_ROCQ = shutil.which("rocq") is not None and shutil.which("coqc") is not Non
 requires_rocq = unittest.skipUnless(
     HAVE_ROCQ, "needs rocq and coqc on PATH (eval $(opam env))")
 
+# Most of the suite compares against `coqc` and needs it.  The session-table
+# tests do not: they run `rocq repl` and assert on what the daemon owns, with
+# no oracle to consult.  Gating them on `coqc` as well would skip them on a
+# switch that ships only the 9.x `rocq` binary.
+HAVE_ROCQ_REPL = shutil.which("rocq") is not None
+requires_rocq_repl = unittest.skipUnless(
+    HAVE_ROCQ_REPL, "needs rocq on PATH (eval $(opam env))")
+
 
 class Workspace:
     """A throwaway one-file Rocq project."""

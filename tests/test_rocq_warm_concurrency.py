@@ -1,22 +1,25 @@
 """Two `rocq-warm check` invocations at once, over one file.
 
-PROVISIONAL -- these are the repros from `CONCURRENCY-BUGS.md` written up as
-tests, and they are RED on purpose until that branch's fixes land.  They may
-not survive in this shape.
-
 Unlike `test_rocq_warm_daemon.py`, which drives the real CLI in a subprocess,
-these drive a `Server` object in-process from two threads.  The races are all
-in the moment an entry is replaced in `Server.sessions`, and reaching that
-moment needs a second request to arrive inside a window a subprocess cannot
-be aimed at.  Nothing here depends on how long a check takes: the tests wait
-on `Entry.lock` and on the session table, never on a sleep.
+these drive a `Server` object in-process from two threads.  Everything being
+asserted here lives in the moment one thread wants a session another thread
+has, and reaching that moment needs a second request to arrive inside a window
+a subprocess cannot be aimed at.  Nothing here waits on a duration: the tests
+key off the session tables, so a slower machine only widens the window.
+
+The property underneath all of them is in `tearDown`, so it is checked by
+every test in the file and not just the one that mentions it: **no `rocq repl`
+this daemon spawned is alive unless the daemon can still reach it.**  That is
+what a session table is for, and every bug these tests were written for was a
+way of losing one.
 """
 
 import os
 import threading
+import time
 import unittest
 
-from rocq_warm_helpers import Workspace, requires_rocq, wait_for
+from rocq_warm_helpers import Workspace, requires_rocq_repl, wait_for
 from rocqwarm import server as server_mod
 from rocqwarm import session as session_mod
 
@@ -35,20 +38,55 @@ def alive(pid):
         return False
 
 
+class TrackingLock:
+    """A lock that remembers which thread holds it.
+
+    Only so a test can assert that some piece of work is NOT done under the
+    session tables' lock.  `threading.Lock` will say it is held; it will not
+    say by whom, and "held by somebody" is not the question.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.owner = None
+
+    def acquire(self, *a, **kw):
+        got = self._lock.acquire(*a, **kw)
+        if got:
+            self.owner = threading.get_ident()
+        return got
+
+    def release(self):
+        self.owner = None
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc):
+        self.release()
+
+    def held_by_me(self):
+        return self.owner == threading.get_ident()
+
+
 class ServerCase(unittest.TestCase):
     """A `Server` on a throwaway workspace, with every child accounted for."""
 
     BODY = QUICK
+    MAX_SESSIONS = server_mod.DEFAULT_MAX_SESSIONS
 
     def setUp(self):
         self.ws = Workspace()
         self.addCleanup(self.ws.cleanup)
         self.path = self.ws.write("C.v", self.BODY)
-        self.srv = server_mod.Server(self.ws.dir)
+        self.srv = server_mod.Server(self.ws.dir, max_sessions=self.MAX_SESSIONS)
+        self.srv.lock = TrackingLock()
         os.makedirs(self.srv.dir, exist_ok=True)
 
         # Every `rocq repl` this daemon spawns, whether or not the session
-        # table still knows about it -- which is the whole question here.
+        # tables still know about it -- which is the whole question here.
         self.spawned = []
         real_start = session_mod.Session.start
 
@@ -60,6 +98,11 @@ class ServerCase(unittest.TestCase):
         self.addCleanup(setattr, session_mod.Session, "start", real_start)
         self.addCleanup(self.kill_spawned)
 
+    def tearDown(self):
+        leaked = self.leaked()
+        self.srv._stop_all()
+        self.assertEqual(leaked, [], "a rocq repl nobody can reach any more")
+
     def kill_spawned(self):
         """Leave no rocq behind, including the ones the daemon lost track of."""
         import signal
@@ -69,8 +112,10 @@ class ServerCase(unittest.TestCase):
             except OSError:
                 pass
 
-    def check(self, **kw):
-        req = {"cmd": "check", "path": self.path}
+    # ------------------------------------------------------------- driving
+
+    def check(self, path=None, **kw):
+        req = {"cmd": "check", "path": path or self.path}
         req.update(kw)
         return self.srv.do_check(req)
 
@@ -82,65 +127,122 @@ class ServerCase(unittest.TestCase):
         t.start()
         return t, out
 
-    @property
-    def entry(self):
-        return self.srv.sessions.get(os.path.abspath(self.path))
+    def wait_until_checking(self):
+        """Block until a check of self.path owns the file and has a rocq."""
+        self.assertTrue(
+            wait_for(lambda: os.path.abspath(self.path) in self.srv.busy
+                     and bool(self.spawned)),
+            "the check never got going")
+
+    # ------------------------------------------------------------ observing
+
+    def slot(self, path=None):
+        key = os.path.abspath(path or self.path)
+        return self.srv.idle.get(key) or self.srv.busy.get(key)
 
     def tracked_pids(self):
-        return [e.sess.proc.pid for e in self.srv.sessions.values()
-                if e.sess.proc is not None]
+        return [sess.live_pid() for _slot, sess in self.srv._live_sessions()]
 
     def leaked(self):
-        """Children that are alive but no longer reachable from the table."""
+        """Children that are alive but no longer reachable from the tables."""
         tracked = self.tracked_pids()
         return [p for p in self.spawned if alive(p) and p not in tracked]
 
+    def recorded_pids(self):
+        try:
+            rows = open(self.srv.pids_path).read().splitlines()
+        except OSError:
+            return []
+        return [int(r.split("\t")[0]) for r in rows if r]
 
-class EntryTableTests(ServerCase):
-    """The table itself.  No rocq runs: `_entry` deliberately spawns nothing."""
 
-    def test_a_fresh_entry_is_not_stale(self):
-        """`_entry` twice over must hand back the same entry.
+class SlotTableTests(ServerCase):
+    """The tables themselves.  No rocq runs: a checkout spawns nothing."""
 
-        The session is started later, by `do_check`, under the entry's own
-        lock -- so a brand-new entry is never `alive`, and `_stale_entry`'s
-        `not entry.sess.alive` test reads that as "cold" and replaces an entry
-        somebody else is about to use.
+    def test_a_returned_slot_is_handed_out_again(self):
+        """Check out, give back, check out: the same slot, not a new one.
+
+        A slot is not made stale by having no session yet.  When it was, a
+        second check arriving in the window before the first had spawned
+        anything replaced the first's slot and started a session of its own.
         """
-        first = self.srv._entry(self.path)
-        self.assertFalse(first.sess.alive, "_entry should not have spawned yet")
-        self.assertIsNone(self.srv._stale_entry(
-            first, first.flags, first.toolchain, False),
-            "a not-yet-started entry was called stale")
-        self.assertIs(self.srv._entry(self.path), first)
+        first = self.srv._checkout(self.path)
+        self.assertIsNone(first.sess, "a checkout should not have spawned yet")
+        self.srv._return(first)
+        # No session, so it is not parked: an empty slot describes nothing.
+        self.assertNotIn(self.path, self.srv.idle)
+        self.assertNotIn(self.path, self.srv.busy)
+
+        second = self.srv._checkout(self.path)
+        self.addCleanup(self.srv._return, second)
+        self.assertIsNotNone(second)
+
+    def test_a_checked_out_file_is_refused_and_gets_no_second_slot(self):
+        """The refusal has to come from a `return`, not a fall-through.
+
+        `_checkout` builds a `Slot` when it finds none.  If the busy test
+        fell through to that instead of returning, a second check would get
+        its own slot and its own `rocq repl` for a file somebody else is
+        already checking -- which is the bug this table shape removes, one
+        missing `return` away.
+        """
+        built = []
+        real_init = server_mod.Slot.__init__
+
+        def counted_init(slot, path):
+            real_init(slot, path)
+            built.append(path)
+
+        held = self.srv._checkout(self.path)
+        self.addCleanup(self.srv._return, held)
+
+        server_mod.Slot.__init__ = counted_init
+        self.addCleanup(setattr, server_mod.Slot, "__init__", real_init)
+        self.assertIsNone(self.srv._checkout(self.path))
+        self.assertEqual(built, [], "a second slot was built for a busy file")
+
+    def test_a_slot_held_past_its_deadline_is_reported(self):
+        """The one failure this model can produce, and it must not be silent.
+
+        A check that hangs for ever never gives its slot back, and its file is
+        refused from then on.  Nothing can safely take the slot away -- the
+        thread that owns it may still be running -- so the daemon says so
+        instead, which is the difference between a diagnosable wedge and a
+        file that mysteriously stopped being checkable.
+        """
+        slot = self.srv._checkout(self.path)
+        self.addCleanup(self.srv._return, slot)
+
+        slot.deadline = time.time() + 3600
+        self.assertEqual(self.srv.report_wedged(), 0, "reported a live check")
+
+        slot.deadline = time.time() - 120
+        self.assertEqual(self.srv.report_wedged(), 1)
+        # Reported, not reclaimed.
+        self.assertIn(os.path.abspath(self.path), self.srv.busy)
+
+    def test_a_slot_is_never_in_both_tables(self):
+        slot = self.srv._checkout(self.path)
+        self.assertIn(self.path, self.srv.busy)
+        self.assertNotIn(self.path, self.srv.idle)
+        self.srv._return(slot)
+        self.assertNotIn(self.path, self.srv.busy)
 
 
-@requires_rocq
+@requires_rocq_repl
 class ConcurrentCheckTests(ServerCase):
 
     BODY = SPIN
 
-    def test_two_cold_checks_of_one_file_share_a_session(self):
-        """The realistic shape: an editor-on-save racing a `make`.
+    def test_a_concurrent_check_of_one_file_is_refused(self):
+        """The realistic shape: an editor-on-save racing an agent.
 
-        Both clients do identical work before `_entry` (`graph.refresh` behind
-        one lock, then `_stale`), so they arrive together without any help
-        from the test.
+        Both threads do identical work before the checkout (`graph.refresh`
+        behind one lock, then `_stale`), so they arrive together without any
+        help from the test.  Exactly one gets a verdict; the other is told the
+        file is busy, promptly, and nothing is left running behind either.
         """
-        entries, bar = [], threading.Barrier(2)
-
-        real_entry = server_mod.Server._entry
-
-        def traced_entry(srv, path, force_cold=False, toolchain=None):
-            e = real_entry(srv, path, force_cold=force_cold,
-                           toolchain=toolchain)
-            entries.append(e)
-            return e
-
-        server_mod.Server._entry = traced_entry
-        self.addCleanup(setattr, server_mod.Server, "_entry", real_entry)
-
-        out = {}
+        bar, out = threading.Barrier(2), {}
 
         def go(name):
             bar.wait()
@@ -152,57 +254,220 @@ class ConcurrentCheckTests(ServerCase):
         for t in threads:
             t.join(timeout=300)
 
-        for name, res in out.items():
-            self.assertTrue(res.get("passed"), "%s: %r" % (name, res))
-        self.assertEqual(len(entries), 2, "both threads should reach _entry")
-        self.assertIs(entries[0], entries[1],
-                      "one file, two concurrent checks, two sessions")
-        self.assertEqual(len(self.tracked_pids()), 1)
-        self.assertEqual(self.leaked(), [], "a rocq nobody can reach")
+        verdicts = [r for r in out.values() if r.get("ok")]
+        refusals = [r for r in out.values() if not r.get("ok")]
+        self.assertEqual(len(verdicts), 1, out)
+        self.assertEqual(len(refusals), 1, out)
+        self.assertTrue(verdicts[0]["passed"], verdicts[0])
 
-    def test_a_replaced_busy_session_is_stopped(self):
-        """Replacing a mid-check entry must not strand its `rocq repl`.
+        # Refused for THIS reason.  Without the `busy` key a stale dependency
+        # or a missing rocq would satisfy the assertion just as well.
+        self.assertIn("busy", refusals[0], refusals[0])
+        self.assertIn("one check per file", refusals[0]["error"])
 
-        `_entry`'s comment promises the busy one is "stopped when its check
-        ends"; nothing does that, and the table was the last reference.
+        self.assertEqual(len(self.tracked_pids()), 1,
+                         "one file, two checks, more than one session")
+
+    def test_the_refusal_does_not_wait_for_the_check(self):
+        """Fail fast is the point: the refusal must not be a disguised queue.
+
+        A `--wait` reintroduced later would still pass every other assertion
+        in this file, and would only show up as a test that takes as long as
+        the proof does.
         """
         thread, out = self.in_background()
-        self.assertTrue(wait_for(lambda: self.entry is not None
-                                 and self.entry.lock.locked()),
-                        "the check never got going")
-        busy = self.entry
+        self.wait_until_checking()
 
-        self.assertIsNot(self.srv._entry(self.path, force_cold=True), busy)
-        self.assertIsNot(self.entry, busy, "the busy entry is still in the table")
+        t0 = time.time()
+        refused = self.check()
+        elapsed = time.time() - t0
+
+        self.assertIn("busy", refused, refused)
+        self.assertLess(elapsed, 2.0,
+                        "the refusal waited for the running check")
+        self.assertGreaterEqual(refused["busy"]["seconds"], 0.0)
 
         thread.join(timeout=300)
         self.assertTrue(out["result"].get("passed"), out["result"])
 
-        # Sample the pid AFTER the check: `Session._check` restarts the session
-        # on the cold path, so a pid taken mid-check is one the session itself
-        # already retired.
-        orphan = busy.sess.proc.pid
-        self.assertTrue(wait_for(lambda: not alive(orphan), timeout=30),
-                        "the replaced session outlived its check")
+    def test_a_cold_check_cannot_take_a_session_mid_check(self):
+        """`--cold` is refused like anything else, and takes nothing.
 
-    def test_a_timing_out_check_does_not_drop_its_replacement(self):
-        """`_drop(path)` resolves by key, so it reaches the wrong entry.
-
-        Once the timing-out check's own entry has been replaced, its cleanup
-        tears down the replacement -- which a third client may already be
-        feeding.
+        It used to replace the entry in the table instead, which stranded the
+        running check's `rocq repl`: the table was the only reference to it,
+        and every way of reclaiming a session looked the table up by path and
+        therefore found the replacement.  Once the file is free, `--cold` does
+        what it says -- in place, in the same slot.
         """
-        thread, out = self.in_background(timeout=3)
-        self.assertTrue(wait_for(lambda: self.entry is not None
-                                 and self.entry.lock.locked()),
-                        "the check never got going")
+        thread, out = self.in_background()
+        self.wait_until_checking()
+        running = self.slot()
 
-        replacement = self.srv._entry(self.path, force_cold=True)
+        self.assertIn("busy", self.check(cold=True))
+
         thread.join(timeout=300)
-        self.assertIn("timed out", out["result"].get("error", ""), out["result"])
+        self.assertTrue(out["result"].get("passed"), out["result"])
+        self.assertIs(self.slot(), running, "the running check lost its slot")
 
-        self.assertIs(self.entry, replacement,
-                      "the timed-out check dropped somebody else's entry")
+        # Now that it is free, --cold restarts in place: same slot, one child.
+        before = running.sess.live_pid()
+        self.assertTrue(self.check(cold=True).get("passed"))
+        self.assertIs(self.slot(), running)
+        self.assertEqual(len(self.tracked_pids()), 1)
+        self.assertNotEqual(self.slot().sess.live_pid(), before,
+                            "--cold did not actually restart the session")
+
+    def test_a_timed_out_check_leaves_the_file_checkable(self):
+        """A discarded session takes its slot with it, and blocks nothing.
+
+        The cleanup used to resolve `_drop(path)` by key, so once the entry
+        had been replaced it tore down somebody else's session instead of its
+        own.  There is nothing to resolve now: the check discards the slot it
+        is holding.
+        """
+        result = self.check(timeout=3)
+        self.assertIn("timed out", result.get("error", ""), result)
+
+        key = os.path.abspath(self.path)
+        self.assertNotIn(key, self.srv.idle)
+        self.assertNotIn(key, self.srv.busy)
+        self.assertEqual(self.tracked_pids(), [])
+
+        again = self.check()
+        self.assertNotIn("busy", again, "the timed-out check wedged the file")
+        self.assertTrue(again.get("passed"), again)
+        self.assertEqual(again["mode"], "cold")
+
+
+@requires_rocq_repl
+class SlotReturnTests(ServerCase):
+    """The hazard checkout introduces: a slot that never comes back."""
+
+    def test_a_slot_is_returned_even_when_the_check_raises(self):
+        """Without the `finally` the file is refused for the daemon's life.
+
+        That is worse than any of the bugs this replaces, and it is invisible
+        until somebody checks the same file twice.
+        """
+        real_check = session_mod.Session.check
+
+        def exploding_check(sess, text, timeout=1800):
+            raise RuntimeError("boom")
+
+        session_mod.Session.check = exploding_check
+        try:
+            with self.assertRaises(RuntimeError):
+                self.check()
+        finally:
+            session_mod.Session.check = real_check
+
+        self.assertNotIn(os.path.abspath(self.path), self.srv.busy)
+        again = self.check()
+        self.assertNotIn("busy", again, "the raising check never gave the slot back")
+        self.assertTrue(again.get("passed"), again)
+
+    def test_a_discarded_session_leaves_nothing_behind(self):
+        """`loaded` describes a process.  It must not outlive one.
+
+        A slot that kept a dead session's loaded set would hand the next check
+        a `watched` set, and `status` a row, about a session that no longer
+        exists -- quiet wrongness of exactly the kind the rest of this tool
+        refuses to produce.
+        """
+        self.assertTrue(self.check().get("passed"))
+        slot = self.slot()
+        self.assertTrue(slot.loaded, "the check recorded nothing as loaded")
+
+        self.assertTrue(self.srv._reclaim(os.path.abspath(self.path)))
+        self.assertIsNone(slot.sess)
+        self.assertEqual(slot.loaded, {})
+        self.assertEqual(slot.libraries, {})
+        self.assertNotIn(os.path.abspath(self.path), self.srv.idle)
+
+
+@requires_rocq_repl
+class BookkeepingTests(ServerCase):
+
+    def test_the_pid_file_names_the_session_that_is_running(self):
+        """It is the only cover for a BUSY child of a killed daemon.
+
+        The daemon holds the only writer on each child's stdin, so its death
+        is an EOF and an idle Rocq exits on its own.  A child mid-`vm_compute`
+        will not read stdin and outlives it -- and used to be absent from the
+        pid file, because the file was written when a table entry was created,
+        which is before the session it names exists.
+        """
+        self.assertTrue(self.check().get("passed"))
+        self.assertEqual(self.recorded_pids(), self.tracked_pids())
+        self.assertEqual(len(self.recorded_pids()), 1)
+
+        other = self.ws.write("D.v", QUICK)
+        self.assertTrue(self.check(path=other).get("passed"))
+        self.assertEqual(sorted(self.recorded_pids()),
+                         sorted(self.tracked_pids()))
+        self.assertEqual(len(self.recorded_pids()), 2)
+
+    def test_the_staleness_check_is_not_under_the_table_lock(self):
+        """`loaded_changed` stats every .vo the session holds.
+
+        Under the tables' lock that is every other file's check waiting behind
+        a few hundred `stat` calls, which is the opposite of what a daemon
+        serving several files at once is for.
+        """
+        seen = []
+        real = server_mod.Slot.loaded_changed
+
+        def watched(slot):
+            seen.append(self.srv.lock.held_by_me())
+            return real(slot)
+
+        self.assertTrue(self.check().get("passed"))     # populates `loaded`
+        server_mod.Slot.loaded_changed = watched
+        self.addCleanup(setattr, server_mod.Slot, "loaded_changed", real)
+        self.assertTrue(self.check().get("passed"))     # ... and consults it
+
+        self.assertTrue(seen, "loaded_changed was never consulted")
+        self.assertNotIn(True, seen,
+                         "loaded_changed ran under the session tables' lock")
+
+
+@requires_rocq_repl
+class EvictionTests(ServerCase):
+    """More files in flight than session slots."""
+
+    MAX_SESSIONS = 1
+
+    def test_eviction_never_strands_a_session(self):
+        """Eviction used to remove an entry a check was about to use.
+
+        `_entry` evicted on its way out, before its caller had taken the
+        entry's lock, and the victim chosen was whichever slot was free --
+        which, with the others busy, was the brand-new one being handed over.
+        The check then started a session in an entry no reclamation path could
+        reach.  It needed no staleness and no `--cold`: only more files at
+        once than session slots.
+        """
+        other = self.ws.write("D.v", QUICK)
+        bar, out = threading.Barrier(2), {}
+
+        def go(name, path):
+            bar.wait()
+            out[name] = self.check(path=path)
+
+        threads = [threading.Thread(target=go, args=(n, p)) for n, p in
+                   (("C", self.path), ("D", other))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=300)
+
+        for name, res in out.items():
+            self.assertTrue(res.get("passed"), "%s: %r" % (name, res))
+        # The budget is one, so at most one session survives -- and whatever
+        # did not survive was stopped, not merely forgotten (tearDown).
+        self.assertLessEqual(len(self.tracked_pids()), self.MAX_SESSIONS)
+        self.assertEqual(sorted(self.recorded_pids()),
+                         sorted(self.tracked_pids()))
 
 
 if __name__ == "__main__":

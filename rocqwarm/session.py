@@ -187,6 +187,20 @@ class Session:
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
+    def live_pid(self):
+        """The child's pid, or None if there is no live child.
+
+        `proc` is read ONCE.  Callers outside the thread that owns this session
+        -- the pid file, `status` -- would otherwise test `alive` and then read
+        `proc.pid`, and a `stop()` landing between the two raises
+        `AttributeError` on None, which is not the `OSError` those callers
+        guard against.
+        """
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return None
+        return proc.pid
+
     def rss_bytes(self):
         try:
             with open("/proc/%d/statm" % self.proc.pid) as f:

@@ -22,6 +22,16 @@ session at all:
   timeout is killed and reported, not left resident -- a large development has a history
   of a single `vm_compute` reaching 31 GB;
 * sessions are evicted LRU under a global memory budget, and idle ones time out.
+
+One check per file at a time, and a second one is REFUSED rather than queued.
+A session is checked out of `self.idle` by the thread that wants it, owned
+outright while it is used, and returned afterwards; being absent from the table
+you take slots from is what excludes everyone else, so a session needs no lock
+of its own.  Two `rocq repl` for one file would be twice several GB spent
+answering one question, and the loser would pay a second full cold start --
+where run one after the other, the second replays warm in no measurable time.
+So the caller that loses is told the file is busy and for how long, and a retry
+costs it nothing.  Nothing in here ever waits on another thread.
 """
 
 import fcntl
@@ -34,7 +44,8 @@ import sys
 import threading
 import time
 
-from . import compile as compile_mod, project, session as session_mod
+from . import (compile as compile_mod, diag, project, report,
+               session as session_mod)
 
 DEFAULT_IDLE_TIMEOUT = 1800.0
 DEFAULT_MAX_SESSIONS = 4
@@ -99,23 +110,79 @@ def _session_ceiling(budget, max_sessions):
     return budget / 2.0
 
 
-class Entry:
-    def __init__(self, sess, flags, cwd, toolchain=None):
-        self.sess = sess
-        self.flags = flags
-        self.cwd = cwd
-        self.toolchain = toolchain
+class Slot:
+    """One file's session, owned outright by whoever checked it out.
+
+    There is no lock here, because a checked-out session is not shared: a slot
+    is handed to exactly one thread at a time by `Server._checkout`, and until
+    that thread gives it back nobody else holds a reference they may use.  A
+    lock would be a rule in a docstring; being absent from the table you take
+    slots from is a fact.
+
+    Nothing on a slot outlives its `rocq repl` -- `loaded` and `libraries`
+    describe what THAT process had loaded, `last_used` only orders live
+    sessions for the LRU, and the flags and toolchain are recomputed from the
+    project on every check.  So a slot with no session is the same thing as no
+    slot, and `Server._return` drops it rather than parking it.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.sess = None            # the rocq repl, or None
+        self.flags = None
+        self.cwd = None
+        self.toolchain = None
         # .vo path -> (mtime_ns, size) as each was when the session loaded it.
         # Filled in after every check from what Rocq says it has loaded.
         self.loaded = {}
         self.libraries = {}         # logical name -> .vo path
         self.last_used = time.time()
-        self.lock = threading.Lock()
+        self.busy_since = None      # set by _checkout, cleared by _return
+        self.deadline = None        # ... and what the check promised to finish by
 
     def loaded_changed(self):
         """Has any .vo the session holds been rebuilt, removed or replaced?"""
         now = project.fingerprint(sorted(self.loaded))
         return any(self.loaded[p] != (m, sz) for p, m, sz in now)
+
+    def ready(self, flags, cwd, toolchain, rocq, env, rss_limit, cold):
+        """The session to check with: started, and answering for THIS build.
+
+        Every reason to throw a session away lands here, where it is a field
+        assignment on an object nobody else can see.  That is the whole trick:
+        `flags` and the toolchain are fixed when a `Session` is constructed, so
+        as long as the construction happened under the session table's lock,
+        changing either of them had to be spelled as a table mutation -- and
+        the table was the only thing holding the child.
+        """
+        if self.sess is not None and not self.sess.alive:
+            self.discard()          # a dead child holds nothing worth keeping
+        # Guarded on there BEING a session: a slot with none has nothing to
+        # invalidate, and `loaded_changed()` would stat every .vo that a
+        # session which no longer exists used to hold.
+        if self.sess is not None:
+            if (flags, toolchain) != (self.flags, self.toolchain):
+                self.discard()
+            elif cold or self.loaded_changed():
+                self.discard()
+        if self.sess is None:
+            self.flags, self.cwd, self.toolchain = flags, cwd, toolchain
+            self.sess = session_mod.Session(
+                self.path, flags, cwd=cwd, rocq=rocq, env=env,
+                rss_limit=rss_limit)
+            self.sess.start()
+        return self.sess
+
+    def discard(self):
+        """Stop the child, and forget everything that described it."""
+        if self.sess is not None:
+            self.sess.stop()
+            self.sess = None
+        # Not bookkeeping: a slot that outlived its session and kept these
+        # would hand the next check a `watched` set, and `status` a row, about
+        # a session that does not exist.
+        self.loaded = {}
+        self.libraries = {}
 
 
 class Server:
@@ -125,7 +192,13 @@ class Server:
         self.dir = os.path.join(self.root, ".rocq-warm")
         self.sock_path = os.path.join(self.dir, "sock")
         self.pids_path = os.path.join(self.dir, "sessions")
-        self.sessions = {}
+        # A session is checked out of `idle`, used, and returned.  A slot in
+        # `busy` is owned by one thread and may be looked at by nobody else
+        # (see `_stop_all` for the single stated exception).  A file with no
+        # session is in neither, so "in neither table" and "has no session"
+        # are the same statement.
+        self.idle = {}
+        self.busy = {}
         self.lock = threading.Lock()
         self.idle_timeout = idle_timeout
         self.max_sessions = max_sessions
@@ -162,71 +235,62 @@ class Server:
                 self.graphs[key] = g
         return g
 
-    def _stale_entry(self, entry, flags, toolchain, force_cold):
-        """Why `entry` cannot be reused now, or None if it can."""
-        if entry.flags != flags:
-            return "the build flags changed"
-        if entry.toolchain != toolchain:
-            return "a different Rocq / opam switch"
-        if entry.loaded_changed():
-            return "a dependency was rebuilt"
-        if force_cold or not entry.sess.alive:
-            return "cold"
-        return None
+    def _checkout(self, path):
+        """The slot for `path`, owned by the caller until `_return`.
 
-    def _entry(self, path, force_cold=False, toolchain=None):
-        """The warm session for `path`, cold-started if anything moved.
+        None if somebody else has it.  Taking the slot OUT of `idle` is the
+        exclusion: there is no lock on a session, because a checked-out session
+        is not shared, and a caller that cannot have one is refused rather than
+        queued.  One check per file at a time.
 
-        The whole get-or-create runs under `self.lock`, so there is exactly
-        ONE Entry per file even when several clients check it at the same
-        instant.  Without that, two threads each build their own session for
-        one file and one thread's `_drop` tears down the process the other is
-        mid-write on -- which surfaces as `NoneType has no attribute stdin`
-        from deep inside a feed.  The Session constructor is cheap (it spawns
-        nothing; `start()` does, later and under the entry's own lock), so
-        holding the lock across it costs nothing.
+        The `busy` test has to come first and has to return rather than fall
+        through: building a second slot for a file somebody is already checking
+        is exactly the bug this replaces, and it is one missing `return` away.
         """
-        key = os.path.abspath(path)
-        flags, cwd = project.flags_for(key)
-        to_stop = None
-        created = False
+        path = os.path.abspath(path)
         with self.lock:
-            entry = self.sessions.get(key)
-            if entry is not None and self._stale_entry(
-                    entry, flags, toolchain, force_cold):
-                # Replace it -- but only actually stop it if nobody is using
-                # it right now.  A session mid-check holds its own lock; tearing
-                # its process out from under the check is the very race this
-                # method exists to avoid.  A still-busy stale session is simply
-                # orphaned from the table and stopped when its check ends.
-                del self.sessions[key]
-                if entry.lock.acquire(blocking=False):
-                    to_stop, entry = entry, None
-                else:
-                    entry = None
-            if entry is None:
-                rocq, env = self._toolchain_env(toolchain)
-                sess = session_mod.Session(
-                    key, flags, cwd=cwd, rocq=rocq, env=env,
-                    rss_limit=_session_ceiling(self.budget, self.max_sessions))
-                entry = Entry(sess, flags, cwd, toolchain)
-                self.sessions[key] = entry
-                created = True
-            entry.last_used = time.time()
-        if to_stop is not None:
-            to_stop.sess.stop()
-            to_stop.lock.release()
-        if created:
-            self._record_sessions()
-            self._evict()
-        return entry
+            if path in self.busy:
+                return None
+            slot = self.idle.pop(path, None)
+            if slot is None:
+                slot = Slot(path)
+            slot.busy_since = time.time()
+            self.busy[path] = slot
+            return slot
 
-    def _drop(self, key):
+    def _return(self, slot):
+        """Give a slot back.  One with no session is dropped, not parked.
+
+        Nothing on an empty slot describes anything that still exists, so
+        keeping it would grow a table entry per file the daemon has ever been
+        asked about and buy nothing.
+        """
         with self.lock:
-            entry = self.sessions.pop(key, None)
-        if entry is not None:
-            entry.sess.stop()
-        self._record_sessions()
+            self.busy.pop(slot.path, None)
+            slot.busy_since = None
+            slot.deadline = None
+            if slot.sess is not None:
+                slot.last_used = time.time()
+                self.idle[slot.path] = slot
+
+    def _slots(self):
+        """Every slot, owned or not -- for the paths that only observe."""
+        with self.lock:
+            return list(self.idle.values()) + list(self.busy.values())
+
+    def _live_sessions(self):
+        """(slot, session) for every slot that has one.
+
+        `slot.sess` is read ONCE per slot: an owner may be discarding it, and
+        the whole point of reading it into a local is that a test and a use
+        cannot then disagree.
+        """
+        out = []
+        for slot in self._slots():
+            sess = slot.sess
+            if sess is not None:
+                out.append((slot, sess))
+        return out
 
     # ------------------------------------------------------- stray children
 
@@ -238,11 +302,18 @@ class Server:
         are left blocked on a closed stdin, holding several GB each, with
         nothing that will ever reap them.  A pid file lets the NEXT daemon
         clean up after the last one.
+
+        Call this wherever a pid appears or goes away, which means after a
+        session STARTS and not merely when a slot is created.  Recording at
+        creation writes down an empty row -- the session starts afterwards --
+        so a daemon holding one session used to record nothing at all, and the
+        reaper had nothing to collect.
         """
         try:
-            with self.lock:
-                rows = ["%d\t%s" % (e.sess.proc.pid, k)
-                        for k, e in self.sessions.items() if e.sess.alive]
+            rows = ["%d\t%s" % (pid, slot.path)
+                    for slot, pid in ((s, sess.live_pid())
+                                      for s, sess in self._live_sessions())
+                    if pid is not None]
             tmp = self.pids_path + ".tmp"
             with open(tmp, "w") as f:
                 f.write("\n".join(rows) + ("\n" if rows else ""))
@@ -289,44 +360,83 @@ class Server:
         that works when the pressure is not ours.  Under real pressure we will
         give up our last session too: degrading to a cold check is a cost we
         pay ourselves, where an OOM kill is a cost somebody else pays.
+
+        Only `idle` is ever taken from, so "do not evict a session that is
+        mid-check" needs no test: a slot somebody is using is not there.  The
+        budget still COUNTS the busy ones, or it would admit sessions against
+        memory that is already spoken for.
         """
         while True:
             with self.lock:
-                items = sorted(self.sessions.items(), key=lambda kv: kv[1].last_used)
-            if not items:
-                return
-            used = sum(e.sess.rss_bytes() for _k, e in items)
+                idle = sorted(self.idle.items(), key=lambda kv: kv[1].last_used)
+                held = len(self.idle) + len(self.busy)
+            if not idle:
+                return                  # everything we hold is mid-check
+            used = sum(sess.rss_bytes() for _s, sess in self._live_sessions())
             avail = _available_bytes()
             pressure = avail is not None and avail < self.min_free
-            if not (pressure or len(items) > self.max_sessions
+            if not (pressure or held > self.max_sessions
                     or used > self.budget):
                 return
-            if not pressure and len(items) == 1:
+            if not pressure and held == 1:
                 return                  # our own budget never costs the last one
-            victim = self._idle_victim(items)
-            if victim is None:
-                return                  # everything we hold is mid-check
-            self._drop(victim)
+            if not self._reclaim(idle[0][0]):
+                continue                # it went busy under us; try the next
 
-    @staticmethod
-    def _idle_victim(items):
-        """The least-recently-used session that is not mid-check.
+    def _reclaim(self, path):
+        """Stop `path`'s session and drop its slot, if nobody is using it.
 
-        Evicting a session out from under a running check would kill the child
-        it is talking to; that recovers, but it wastes exactly the work we are
-        trying to save.
+        Check the victim out like any other caller and simply do not give it
+        back.  That is not ceremony: `discard()` waits on the child, so it
+        cannot run under `self.lock`, and a version that popped the slot from
+        `idle` first would leave it in NEITHER table with its `rocq repl` still
+        alive -- the unreachable child this design exists to make impossible.
+        Held in `busy` for the length of the stop, it stays reachable
+        throughout, and `_return` then drops it because its session is gone.
         """
-        for key, entry in items:
-            if entry.lock.acquire(blocking=False):
-                entry.lock.release()
-                return key
-        return None
+        slot = self._checkout(path)
+        if slot is None:
+            return False
+        try:
+            slot.discard()
+        finally:
+            self._return(slot)
+        self._record_sessions()
+        return True
 
     def reap_idle(self):
         now = time.time()
-        for key, entry in list(self.sessions.items()):
-            if now - entry.last_used > self.idle_timeout:
-                self._drop(key)
+        with self.lock:
+            timed_out = [k for k, s in self.idle.items()
+                         if now - s.last_used > self.idle_timeout]
+        for key in timed_out:
+            self._reclaim(key)
+
+    def report_wedged(self):
+        """Say so when a slot has been checked out past its own deadline.
+
+        Every check carries a wall timeout, so no slot can legitimately still
+        be held long after it: one that is means the check machinery itself is
+        stuck, and its file has been refusing checks ever since.  That is the
+        one failure this ownership model can produce, and it is silent unless
+        somebody says it out loud.
+
+        It deliberately does NOT reclaim the slot.  The thread that owns it may
+        still be running, and taking a session away from a thread that is using
+        it is exactly the class of bug the model removes.
+        """
+        now = time.time()
+        with self.lock:
+            wedged = [(s.path, now - (s.busy_since or now))
+                      for s in self.busy.values()
+                      if s.deadline is not None and now > s.deadline + 60]
+        for path, held in wedged:
+            compile_mod.log(
+                "WEDGED: %s has been checked out for %.0fs, past the timeout "
+                "of the check holding it; every check of it is being refused. "
+                "Not reclaiming it -- the thread that owns it may still be "
+                "running.", path, held)
+        return len(wedged)
 
     # -------------------------------------------------------------- requests
 
@@ -338,15 +448,30 @@ class Server:
             return self.do_status()
         if cmd == "stop":
             self.compiler.stop()
-            for key in list(self.sessions):
-                self._drop(key)
+            self._stop_all()
             return {"ok": True, "stopped": True}     # _serve_one then exits
         if cmd == "ping":
             return {"ok": True, "pid": os.getpid()}
         return {"ok": False, "error": "unknown command %r" % cmd}
 
     def do_check(self, req):
+        """Check a file, and say exactly what to print and what to exit with.
+
+        The rendering is in `report`, on this side of the socket.  The daemon
+        has the bytes it checked, the workspace root and the compile job; a
+        client that re-derives any of that is a second implementation of the
+        same policy -- and the exit code IS policy, since "could not be
+        checked" (2) and "the proof is wrong" (1) are the distinction the
+        whole tool turns on.  So `rocq-warm check` writes two strings and
+        exits.
+        """
         path = os.path.abspath(req["path"])
+        resp = self._check(path, req)
+        resp["out"], resp["log"], resp["exit"] = report.check(
+            resp, path, self.root, req)
+        return resp
+
+    def _check(self, path, req):
         try:
             text = open(path, "rb").read()
         except OSError as e:
@@ -388,53 +513,73 @@ class Server:
                     "error": "%d stale dependenc%s" % (
                         len(stale), "y" if len(stale) == 1 else "ies")}
 
-        entry = self._entry(path, force_cold=bool(req.get("cold")),
-                            toolchain=toolchain)
-        # Everything we know the session holds or is about to load, stat'ed
-        # BEFORE it loads anything.  A .vo rebuilt while the check runs must
-        # not be recorded with its new mtime as if that were what was loaded.
-        watched = sorted(set(closure) | set(entry.loaded))
-        pre = {p: (m, sz) for p, m, sz in project.fingerprint(watched)}
-        with entry.lock:
-            if not entry.sess.alive:
-                entry.sess.start()
+        # One check per file at a time.  A second one is refused outright
+        # rather than queued: what it would be waiting on is a proof, so no
+        # deadline is honest, and once the running check finishes the same
+        # question is answered by a warm replay that executes nothing.
+        slot = self._checkout(path)
+        if slot is None:
+            return self._busy_refusal(path)
+        try:
+            slot.deadline = t0 + timeout
+            # Make room BEFORE spawning, not after: this slot is already in
+            # `busy`, so it is counted (right -- we are about to fill it) and
+            # cannot itself be chosen (right -- it is being used).
+            self._evict()
+            # Everything we know the session holds or is about to load, stat'ed
+            # BEFORE it loads anything.  A .vo rebuilt while the check runs must
+            # not be recorded with its new mtime as if that were what was loaded.
+            watched = sorted(set(closure) | set(slot.loaded))
+            pre = {p: (m, sz) for p, m, sz in project.fingerprint(watched)}
+            sess = slot.ready(
+                flags, cwd, toolchain, rocq, env,
+                _session_ceiling(self.budget, self.max_sessions),
+                cold=bool(req.get("cold")))
+            self._record_sessions()     # there is a pid now, and not before
             try:
-                result = entry.sess.check(text, timeout=timeout)
+                result = sess.check(text, timeout=timeout)
             except session_mod.FeedTimeout as e:
-                entry.sess.stop()
-                self._drop(path)
+                slot.discard()
                 return {"ok": False, "error": "timed out after %.0fs (%s); "
                                               "session discarded" % (timeout, e)}
             except session_mod.MemoryLimit as e:
-                entry.sess.stop()
-                self._drop(path)
+                slot.discard()
                 return {"ok": False,
                         "error": "%s; session discarded (raise the ceiling "
                                  "with ROCQ_WARM_MAX_SESSION_GB)" % e}
             except session_mod.SessionDead as e:
-                self._drop(path)
+                slot.discard()
                 return {"ok": False, "error": "rocq died: %s" % e}
             unreliable = None
             try:
-                libraries = entry.sess.loaded_libraries()
+                libraries = sess.loaded_libraries()
             except Exception as e:                      # noqa: BLE001
                 libraries, unreliable = {}, "%s: %s" % (type(e).__name__, e)
-            rss = entry.sess.rss_bytes()
-        post = {p: (m, sz) for p, m, sz in project.fingerprint(
-            sorted(set(watched) | set(libraries.values())))}
-        entry.loaded = {p: pre.get(p, post[p]) for p in post}
-        entry.libraries = libraries
-        moved = [p for p in watched if pre[p] != post[p]]
-        note = None
-        if moved:
-            note = ("%s changed during the check; the verdict may be about "
-                    "either version, and the session was discarded"
-                    % ", ".join(os.path.relpath(p, self.root) for p in moved))
-            self._drop(path)
-        elif unreliable:
-            note = ("could not ask rocq what it loaded (%s); the session was "
-                    "discarded" % unreliable)
-            self._drop(path)
+            rss = sess.rss_bytes()
+            post = {p: (m, sz) for p, m, sz in project.fingerprint(
+                sorted(set(watched) | set(libraries.values())))}
+            moved = [p for p in watched if pre[p] != post[p]]
+            note = None
+            if moved:
+                note = ("%s changed during the check; the verdict may be about "
+                        "either version, and the session was discarded"
+                        % ", ".join(os.path.relpath(p, self.root) for p in moved))
+                slot.discard()
+            elif unreliable:
+                note = ("could not ask rocq what it loaded (%s); the session "
+                        "was discarded" % unreliable)
+                slot.discard()
+            else:
+                slot.loaded = {p: pre.get(p, post[p]) for p in post}
+                slot.libraries = libraries
+        finally:
+            # Unmissable: a slot that is never given back leaves its file
+            # refused for the daemon's life.
+            self._return(slot)
+            self._record_sessions()
+        # The file is checkable again from here.  A `--compile` is a real
+        # `rocq compile` that can run for minutes and does not touch the
+        # session, so it must not be inside the checkout.
         compile_mod.log("check: %s %s [%s, %d sentences, %.1fs]%s", path,
                         "OK" if result.ok else "FAILED", result.mode,
                         result.replayed, result.seconds,
@@ -462,11 +607,40 @@ class Server:
             # Why make would rebuild THIS file's .vo now -- after a green
             # check that is "its source is newer", which the user is told.
             "vo_stale": project.staleness(project.vo_of(path), graph.graph),
+            # The digest of the bytes this verdict is about, so a caller that
+            # edits fast can tell whether it is about what it wrote.
+            "digest": digest,
+            # Resolved HERE, against the text we actually checked.  The client
+            # used to re-read the .v to turn these offsets into a line, with
+            # nothing tying the two reads together.
             "diags": [{"kind": d.kind,
                        "span": d.span(text),
+                       "at": diag.line_col(text, d.span(text)),
                        "message": d.message().decode("utf8", "replace")}
                       for d in result.diags],
         }
+
+    def _busy_refusal(self, path):
+        """A check that did not happen because the file is being checked.
+
+        Exit 2 at the client, alongside a stale dependency: not a verdict about
+        the proof.  It carries how long the file has been busy, which is what
+        makes a session wedged by a hung check diagnosable rather than a
+        mystery -- a file that has been busy for three days says so.
+        """
+        with self.lock:
+            slot = self.busy.get(path)
+            since = slot.busy_since if slot is not None else None
+        row = {"path": path, "since": since,
+               "seconds": None if since is None else time.time() - since}
+        # The elapsed time is the part that can be missing -- the slot may have
+        # been given back between the failed checkout and this lookup -- so the
+        # reason is phrased the same either way, and only the detail varies.
+        detail = ("" if row["seconds"] is None
+                  else ", running for %.0fs" % row["seconds"])
+        return {"ok": False, "busy": row,
+                "error": "one check per file at a time, and this file is "
+                         "already being checked%s" % detail}
 
     # ------------------------------------------------------------ staleness
 
@@ -528,23 +702,42 @@ class Server:
             self.compiler.cancel(path)
 
     def do_status(self):
+        """What the daemon is holding, including what is being checked now.
+
+        This reads sessions it does not own, which is allowed because it only
+        OBSERVES: a pid, an RSS, and the length of a list the owner may be
+        appending to.  Each is a single read that cannot raise, and the worst
+        it can report is a number from the middle of a running check -- which
+        is the number `status` is being asked for.
+        """
+        now = time.time()
         out = []
-        for key, entry in sorted(self.sessions.items()):
+        for slot, sess in sorted(self._live_sessions(),
+                                 key=lambda pair: pair[0].path):
+            busy_since = slot.busy_since
             out.append({
-                "path": key,
-                "pid": entry.sess.proc.pid if entry.sess.alive else None,
-                "alive": entry.sess.alive,
-                "sentences": len(entry.sess.sentences),
-                "complete": entry.sess.complete,
-                "rss": entry.sess.rss_bytes(),
-                "idle": time.time() - entry.last_used,
-                "libraries": len(entry.libraries),
-                "watched": len(entry.loaded),
+                "path": slot.path,
+                "pid": sess.live_pid(),
+                "alive": sess.live_pid() is not None,
+                "sentences": len(sess.sentences),
+                "complete": sess.complete,
+                "rss": sess.rss_bytes(),
+                # `idle` is time since it was last GIVEN BACK, which for a
+                # session being checked right now is not idleness at all --
+                # hence `busy`, and how long it has been that way.
+                "idle": now - slot.last_used,
+                "busy": busy_since is not None,
+                "busy_for": None if busy_since is None else now - busy_since,
+                "libraries": len(slot.libraries),
+                "watched": len(slot.loaded),
             })
-        return {"ok": True, "pid": os.getpid(), "uptime": time.time() - self.started,
+        resp = {"ok": True, "pid": os.getpid(),
+                "uptime": time.time() - self.started,
                 "budget": self.budget, "min_free": self.min_free,
                 "available": _available_bytes(), "sessions": out,
                 "compiles": self.compiler.status()}
+        resp["out"] = report.status(resp)
+        return resp
 
     # ----------------------------------------------------------------- serve
 
@@ -595,7 +788,8 @@ class Server:
                     self.shutdown()             # the workspace itself is gone
                 self.reap_idle()
                 self._evict()
-                if self.sessions:
+                self.report_wedged()
+                if self.idle or self.busy:
                     empty_since = None
                     continue
                 empty_since = empty_since or time.time()
@@ -604,11 +798,35 @@ class Server:
             except Exception:
                 pass
 
+    def _stop_all(self):
+        """Stop every child, owned or not.  Never leave one behind.
+
+        The single place a non-owner touches a busy slot's session, and it is
+        deliberate: the daemon is on its way out, a mid-check child has to die
+        anyway, and a shutdown that waits for a thirty-minute check to hand its
+        slot back is exactly the hang a shutdown path must not have.  It
+        reaches everything because everything with a session is in one of the
+        two tables.
+        """
+        for _slot, sess in self._live_sessions():
+            try:
+                sess.stop()
+            except Exception:                       # noqa: BLE001
+                pass
+        with self.lock:
+            # `idle` is ours to drop; `busy` is NOT, even here.  Clearing it
+            # would let a second checkout of a path somebody still owns
+            # succeed, which is the one thing these tables exist to prevent.
+            # An owner returning a slot whose child we just killed parks a
+            # dead session, and the next `ready()` rebuilds it -- which is
+            # what it does for any session that died on its own.
+            self.idle.clear()
+        self._record_sessions()
+
     def shutdown(self):
         """Stop every session, then the daemon.  Never leave a child behind."""
         self.compiler.stop()
-        for key in list(self.sessions):
-            self._drop(key)
+        self._stop_all()
         os._exit(0)
 
     def _serve_one(self, conn):

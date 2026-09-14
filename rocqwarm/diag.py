@@ -112,14 +112,34 @@ def strip_location(raw):
     return txt.strip()
 
 
-def render(display_path, text, span, message):
-    """One diagnostic, byte-for-byte in `coqc`'s shape."""
-    body = message.decode("utf8", "replace")
+def line_col(text, span):
+    """(line, first column, last column) for a byte span, as `coqc` counts.
+
+    Split out from `render` so that whoever HAS the text resolves the offsets
+    against it.  The daemon read the file and checked exactly those bytes; a
+    client that re-reads the file afterwards to resolve them is reading a
+    different file if the edit loop moved on, and silently reports the
+    diagnostic on the wrong line.
+    """
     if span is None:
+        return None
+    start, end = span
+    bol = line_bol(text, start)
+    return (line_number(text, start), start - bol, end - bol)
+
+
+def render_at(display_path, where, body):
+    """One diagnostic, byte-for-byte in `coqc`'s shape, from `line_col`."""
+    if where is None:
         # Rocq's message already carries its own `Error:`/`Warning:` prefix;
         # all that is missing is a location, and there is none to give.
         return body
-    start, end = span
-    bol = line_bol(text, start)
+    line, first, last = where
     return 'File "%s", line %d, characters %d-%d:\n%s' % (
-        display_path, line_number(text, start), start - bol, end - bol, body)
+        display_path, line, first, last, body)
+
+
+def render(display_path, text, span, message):
+    """One diagnostic, for a caller that holds the text the span is into."""
+    return render_at(display_path, line_col(text, span),
+                     message.decode("utf8", "replace"))

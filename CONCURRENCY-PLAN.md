@@ -524,13 +524,21 @@ time since `last_used`, which does not distinguish "idle 3s, finished" from
 And one correctness fix that matters more for an agent than for a human, which
 is bug 4:
 
-**3. The server renders diagnostic locations and echoes the digest.** It
-already has the exact bytes it checked and already computes
-`digest_of(text=text)`. Returning `line`/`col_start`/`col_end` alongside the
-span removes the client's second `open(path, "rb").read()` -- the unguarded
-re-read that silently reports a diagnostic at the wrong line when the file
-changed during a check. Returning the digest lets an agent confirm the verdict
-is about the bytes it wrote. An agent edits fast enough for both to matter.
+**3. The server renders the reply, and echoes the digest.** This began as
+"return `line`/`col_start`/`col_end` instead of byte offsets", to remove the
+client's second `open(path, "rb").read()` -- the unguarded re-read that
+silently reports a diagnostic at the wrong line when the file changed during a
+check. It ended up further along, and better: the daemon returns the finished
+stdout, the finished stderr, and the exit code, and `rocq-warm check` writes
+two strings and exits.
+
+The re-read was a symptom. The daemon is the side that has the bytes it
+checked, the workspace root and the compile job, so every question the client
+was answering -- where is this diagnostic, is this path worth showing
+absolute, did the `.vo` get written, is this a 1 or a 2 or a 3 -- it was
+answering from a worse position, and a second time. Deciding it once, where
+the evidence is, is both smaller and harder to get wrong. Returning the digest
+alongside lets an agent confirm the verdict is about the bytes it wrote.
 
 ### Deliberately not built
 

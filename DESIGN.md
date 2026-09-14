@@ -246,7 +246,33 @@ and they are not the problem.
 ## Sessions
 
 One daemon per workspace, one `rocq repl` per `.v` file, each child in its own
-process group. Sessions are keyed on the file, the build flags, and the
+process group.
+
+**A session is checked out, used, and returned**, and that is the whole of the
+concurrency design. A file's slot lives in one of two tables — `idle`, which
+slots are taken *from*, and `busy`, where one may only be looked at — and
+moves between them under a single lock that does nothing else and is never
+held across anything that blocks. Taking the slot out of `idle` is what
+excludes everybody else, so a session needs no lock of its own: a lock is a
+rule somebody has to remember, and being absent from the table you take slots
+from is a fact. A checkout of a file that is already checked out fails, and the
+caller is told; nothing in the daemon ever waits on another thread, so there is
+no lock ordering to establish and no hang to reason about.
+
+Everything that used to be "replace the entry in the table" is now a field
+assignment on a slot nobody else can see — including the two cases that forced
+the old shape, a change of build flags or of toolchain, which are fixed when a
+`Session` is constructed and so could not be changed in place while that
+construction happened under the table's lock. A slot with no session is the
+same thing as no slot, and is dropped rather than parked: `loaded` and
+`libraries` describe the process that is gone, `last_used` only orders live
+sessions for the LRU, and the flags are recomputed every check. Eviction and
+idle reaping therefore check their victim out like any other caller and simply
+do not give it back — not ceremony, but because stopping a child waits on it
+and so cannot happen under the table lock, and a slot popped from `idle` first
+would sit in neither table with its `rocq repl` still alive.
+
+Sessions are keyed on the file, the build flags, and the
 **toolchain**: the absolute `rocq` the client resolved plus the environment
 that resolved it (`PATH`, `OCAMLPATH`, `COQPATH`, `COQLIB`, …). A daemon
 outlives the shell that started it, and on a machine with several opam switches
