@@ -32,12 +32,18 @@ becomes what it should have been: a record of who owns what.
 A session is **checked out, used, and returned**. There is no lock on a
 session, because a checked-out session is not shared with anybody.
 
-> A file's **`Slot`** is in exactly one of two tables: `self.idle`, where a
-> slot may be taken from, and `self.busy`, where a slot may only be *looked
-> at*. `_checkout` moves it one way and `_return` moves it back, both under
-> `self.lock`. **A thread may use the session inside a slot only between its
-> own checkout and its own return** -- during which the slot is in `busy`, and
-> the checking thread holds the only reference anyone is allowed to use.
+> A **`Slot`** holding a live session is in exactly one of two tables:
+> `self.idle`, which slots may be taken *from*, and `self.busy`, where a slot
+> may only be *looked at*. `_checkout` moves it one way and `_return` moves it
+> back, both under `self.lock`. **A thread may use the session inside a slot
+> only between its own checkout and its own return** -- during which the slot
+> is in `busy`, and the checking thread holds the only reference anyone is
+> allowed to use.
+
+A file with no session is in neither table, and a slot that has lost its
+session is discarded rather than parked, so "in neither table" and "has no
+session" are the same statement. See
+[What the tables mean](#what-the-tables-mean-and-what-they-do-not).
 
 Checking out a file that is already checked out does not wait and does not
 create a second slot. It fails, and the caller is told the file is busy.
@@ -84,15 +90,16 @@ worse design. Fail-fast is what makes it the simpler one.
 
 ## Why that is enough
 
-Each bug's absence is a one-line consequence of "in exactly one table, moved
-only under the lock".
+Each bug's absence is a one-line consequence of "a session is in exactly one
+table, and moves only under the lock".
 
-**Every live `rocq repl` is reachable.** A slot is in `idle` or in `busy` at
-every instant, including every instant during the move, because the move
-happens under the lock. A process lives in `slot.sess` and is created and
-destroyed only by the thread that holds the slot. So there is no state in which
-a live child is not reachable from one of the two tables -- there is no
-operation that drops a reference to a slot at all, only one that moves it.
+**Every live `rocq repl` is reachable.** A slot is created already on its way
+into `busy`, under the lock, before it can hold a session; from then until its
+session is stopped it is in `idle` or in `busy`, including at every instant of
+a move, because the move happens under the lock. A slot leaves both tables only
+in the same critical section that finds `sess is None`. So there is no state in
+which a live child is unreachable: the only operation that drops a reference to
+a slot is the one that has just established there is no child behind it.
 *Bugs 1, 5 and 6.*
 
 **A key names one slot**, so "drop the session for this path" and "drop the
@@ -239,7 +246,7 @@ class Slot:
         self.busy_since = None      # set by _checkout, cleared by _return
 
     def ready(self, flags, cwd, toolchain, rocq, env, cold)
-    def discard(self)               # stop the session, keep the slot
+    def discard(self)               # stop the child, forget what it loaded
 ```
 
 The whole of the concurrency lives in two Server methods:
@@ -260,38 +267,101 @@ def _checkout(self, path):
 
 def _return(self, slot):
     with self.lock:
+        del self.busy[slot.path]
         slot.busy_since = None
-        slot.last_used = time.time()
-        self.idle[slot.path] = self.busy.pop(slot.path)
+        if slot.sess is not None:           # an empty slot is not worth keeping
+            slot.last_used = time.time()
+            self.idle[slot.path] = slot
 ```
 
 Two notes on `_checkout`, because they are the only places it can go wrong.
 The `busy` test must come first and must return rather than fall through to
 `Slot(path)`: building a second slot for a checked-out file is precisely the
 bug being fixed, and it is one missing `return` away. And `_return` must be
-unmissable -- a `finally`, or better a context manager, since a slot that is
-never returned leaves its file permanently refused.
+unmissable -- a `finally`, or better a context manager -- for the reason in
+[A slot that is never returned](#a-slot-that-is-never-returned) below.
+
+### What the tables mean, and what they do not
+
+A path is in exactly one of three states, and they say everything:
+
+| state | where | what a checkout does |
+|---|---|---|
+| no session | in neither table | make a `Slot`, put it in `busy`, hand it over |
+| has a session, free | in `idle` | move it to `busy`, hand it over |
+| checked out | in `busy` | refuse: this file is being checked |
+
+The first row is the one worth being deliberate about. **A slot with no session
+is the same thing as no slot**, so `_return` drops it rather than parking it,
+and `_evict`/`reap_idle` remove theirs rather than emptying them in place. A
+slot carries nothing that outlives its session: `loaded` and `libraries`
+describe what *that* `rocq repl` had loaded, `last_used` exists only to order
+live sessions for the LRU, and `flags`/`cwd`/`toolchain` are recomputed from
+the project on every check. There is nothing to preserve.
+
+Two things follow, both worth having. The tables stay proportional to the
+sessions that exist rather than growing a slot per file the daemon has ever
+been asked about. And `discard()` must **clear `loaded` and `libraries`** as
+well as stopping the child -- today `_drop` throws the whole entry away so the
+question never arises, but a slot that outlives its session and keeps its
+loaded set would hand the next check a `watched` set (`:396`) and a `status`
+row (`:542`) describing a session that no longer exists.
+
+### A slot that is never returned
+
+It is distinguishable from a file that was never started, and that is exactly
+what `busy` is for: absent means "no session, go ahead", present means "someone
+has it". The one bit `_checkout` reads is the difference between them.
+
+The `finally` covers every exception, `BaseException` included, so the only way
+to really never return a slot is a thread that hangs forever inside the check.
+Two things to say about that. It is not a regression: a thread stuck holding a
+per-slot lock has the identical symptom with less to say about it. And it is
+not silent, because the refusal reports `busy_since` -- a file that has been
+busy for three days says so, in the message, on the first check that hits it.
+
+Record the check's **deadline** at checkout alongside `busy_since`, and the
+reaper can turn that from a report into an assertion: no slot can legitimately
+be busy past its own deadline plus slack, so one that is means the check
+machinery is broken, and the reaper should log it loudly.
+
+It should not *reclaim* it. The owning thread may still be running, and taking
+a session away from a thread that is using it is the ownership bug this whole
+plan removes. Report, and leave it alone.
 
 `ready()` is where every "throw the session away" reason now lands, and it is a
 straight line with no table in it:
 
 ```python
 def ready(self, flags, cwd, toolchain, rocq, env, cold):
-    if (flags, toolchain) != (self.flags, self.toolchain):
-        self.discard()
-        self.flags, self.cwd, self.toolchain = flags, cwd, toolchain
-    elif cold or self.loaded_changed():
-        self.discard()
+    if self.sess is not None:               # nothing to throw away otherwise
+        if (flags, toolchain) != (self.flags, self.toolchain):
+            self.discard()
+        elif cold or self.loaded_changed():
+            self.discard()
     if self.sess is None:
+        self.flags, self.cwd, self.toolchain = flags, cwd, toolchain
         self.sess = session_mod.Session(self.path, self.flags, cwd=self.cwd,
                                         rocq=rocq, env=env, rss_limit=...)
     if not self.sess.alive:
         self.sess.start()
     return self.sess
+
+def discard(self):
+    """Stop the child, and forget everything that described it."""
+    if self.sess is not None:
+        self.sess.stop()
+        self.sess = None
+    self.loaded, self.libraries = {}, {}
 ```
 
 The flags/toolchain case is no longer special. That is the whole trick: it was
 special only because the constructor was on the wrong side of the wrong lock.
+
+The `self.sess is not None` guard at the top is not just tidiness: without it a
+slot with no session pays `loaded_changed()`, which is a `stat` of every `.vo`
+a session that no longer exists used to hold. There is nothing there to
+invalidate.
 
 `do_check` loses its five `self._drop(path)` calls and gains a `finally`:
 
@@ -328,14 +398,32 @@ real `rocq compile` unless the boundary is drawn here.
 
 Deleted outright: the replacement block in `_entry` (`:202`-`:206`) with its
 `del`, its try-lock and its `to_stop`; `_stale_entry`'s `not entry.sess.alive`
-clause; `_drop`'s lookup by key; and `_idle_victim` entirely.
+clause; and `_drop` and `_idle_victim` in their entirety, both replaced by
+`_checkout` / `discard` / `_return`.
 
 The reclamation paths only ever look at `idle`:
 
-* `_evict` and `reap_idle` pick the LRU slot **in `idle`** and `discard()` it.
-  No lock probing, no "is this one mid-check": a busy slot is not there to be
-  picked. They may take the last idle session under machine-wide pressure,
-  exactly as today.
+* `_evict` and `reap_idle` **check the victim out like anybody else**, and then
+  simply do not give it back:
+
+  ```python
+  victim = self._checkout(lru_path_in_idle)   # None: it went busy, skip it
+  if victim is not None:
+      victim.discard()                        # outside the lock; stop() blocks
+      self._return(victim)                    # sess is None, so it is dropped
+  ```
+
+  This is worth doing rather than popping from `idle` directly, and the reason
+  is the invariant above. `discard()` calls `stop()`, which waits on the child
+  and therefore must not run under `self.lock` -- so a version that popped the
+  slot first would leave it in neither table while its `rocq repl` was still
+  alive, which is exactly the unreachable state this design exists to make
+  impossible. Checking it out keeps it in `busy` for the whole of the stop.
+
+  It also means eviction needs no notion of "mid-check" at all: `_checkout`
+  returning `None` *is* "somebody is using it, leave it alone". `_idle_victim`
+  and `_drop` both go away; picking the victim is a `min` over `idle` by
+  `last_used`, and nothing more.
 * `shutdown` is the one place that touches `busy`, and the reason belongs in
   the docstring: it is about to `os._exit`, a mid-check child has to die
   anyway, and a shutdown that waits for a thirty-minute check is the hang a
@@ -344,8 +432,9 @@ The reclamation paths only ever look at `idle`:
 * `_record_sessions` moves to where a pid changes -- after `ready()` starts a
   session, and inside `discard()` -- iterates both tables, and reads `proc`
   once through a new `Session.live_pid()`, which `do_status` uses too.
-* "Is the daemon empty?" becomes "no slot in either table holds a session",
-  rather than `if self.sessions:`.
+* "Is the daemon empty?" becomes `not self.idle and not self.busy`, rather than
+  `if self.sessions:` -- which works precisely because a slot without a session
+  is not in either table.
 
 ### Looking at a busy slot
 
@@ -497,7 +586,7 @@ that will no longer happen, or on a second check that will no longer run.
 | `test_a_fresh_entry_is_not_stale` | passes once the `alive` clause goes. Restate it for checkout: check out, return, check out again, and assert the *same* slot comes back -- a not-yet-started session must not cost anyone a new one |
 | `test_two_cold_checks_of_one_file_share_a_session` | premise gone: they do not share, the second is refused. Rewrite as `test_a_concurrent_check_of_one_file_is_refused` -- two threads off a barrier, exactly one verdict and one `busy` refusal, one `rocq repl`, nothing leaked |
 | `test_a_replaced_busy_session_is_stopped` | premise gone. Rewrite: a `--cold` check arriving mid-check is refused and the running check is unharmed; the *next* `--cold` check restarts in place, one slot, one live pid |
-| `test_a_timing_out_check_does_not_drop_its_replacement` | premise gone. Rewrite: a timed-out check discards its session and releases a usable slot; the next check cold-starts in the same slot |
+| `test_a_timing_out_check_does_not_drop_its_replacement` | premise gone. Rewrite: a timed-out check discards its session and leaves the file in neither table; the next check is not refused and cold-starts |
 
 The rewritten second test is the one to be careful with. "Refused" has to mean
 refused *for this reason*: assert on the `busy` key, not merely on `ok` being
@@ -519,8 +608,14 @@ And two for the hazards checkout introduces, which are the price of it:
 * **a slot is always returned.** Make `do_check` raise from inside the
   checkout (patch `Session.check` to throw something unexpected), then assert
   the next check of that file is not refused. Without the `finally` the file
-  is dead for the daemon's life, which is a worse failure than any bug in the
-  notes, and it is invisible until somebody checks that file twice.
+  is dead for the daemon's life, and it is invisible until somebody checks
+  that file twice.
+* **a discarded session leaves nothing behind.** After a check whose session is
+  dropped (`--cold` on the next one, or a `.vo` moving mid-check), assert the
+  path is in neither table, and that a slot handed out afterwards has an empty
+  `loaded`. A slot that keeps a dead session's loaded set is not a crash; it is
+  a `watched` set and a `status` row about a session that does not exist, which
+  is the class of quiet wrongness the rest of this codebase refuses.
 * **a busy file never gets a second slot.** Check one out by hand, call
   `_checkout` again, assert it returns `None` *and* that no new `Slot` was
   constructed -- the missing `return` that falls through to `Slot(path)` is
@@ -541,8 +636,9 @@ already written in the harness and currently asserted in one test out of four.
 Independently shippable, in this order:
 
 1. `Slot`, `_checkout`, `_return`, `ready`, `discard`; delete the replacement
-   path and `_idle_victim`. Fixes bugs 1, 2, 3 and findings 6 and 7. The only
-   step that touches the session table, and the only one that is not small.
+   path, `_drop` and `_idle_victim`, and route eviction and idle reaping
+   through `_checkout`. Fixes bugs 1, 2, 3 and findings 6 and 7. The only step
+   that touches the session table, and the only one that is not small.
 2. `_record_sessions` at start/stop, plus `Session.live_pid()`. Fixes finding 5.
 3. The `busy` refusal on `check`, and its message; `status --json` with the
    busy bit if it is wanted.
