@@ -123,5 +123,14 @@ def normalize(text, root=None):
 
 
 def render_all(result, display, text):
-    """rocq-warm's diagnostics, normalized the same way `coqc`'s are."""
-    return normalize("\n".join(d.render(display, text) for d in result.diags))
+    """rocq-warm's DIAGNOSTICS, normalized the same way `coqc`'s are.
+
+    Errors and warnings only.  A check also reports what the sentences it
+    executed printed, and that is deliberately not `coqc`'s output: a REPL
+    prints "foo is defined" for a definition where a batch compile says
+    nothing, and a warm run does not re-print what its reused prefix printed.
+    The property these tests exist for is the verdict and the diagnostics;
+    the output has its own tests in `test_rocq_warm_daemon.py`.
+    """
+    return normalize("\n".join(d.render(display, text) for d in result.diags
+                               if d.kind != "info"))

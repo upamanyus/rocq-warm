@@ -8,6 +8,20 @@ check replays only from the first sentence the edit could have touched.
 Rocq 9.0.1 for `Require`, `Notation` (the parser itself), `Ltac` and
 `Set`/`Unset` -- which is what makes the prefix genuinely reusable rather than
 merely "probably fine".
+
+Everything a sentence printed comes back with it, so the `Show.` added to see a
+stuck goal is answered -- and it is answered by a warm session, which is the
+whole point: the reason to look at a goal is that the proof is stuck, which is
+exactly when a cold run of the file is least affordable.  Nothing is silenced
+to achieve that and nothing extra is asked of Rocq; the output was always in
+the stream, and a check simply stops filtering the part that belongs to the
+sentences it executed.  See `PROLOGUE` for what `Set Silent.` does and does not
+suppress, which is not what its name suggests.
+
+The prefix's output is not reported.  It printed nothing this time round, and
+re-printing a goal from three edits ago next to one just computed is worse than
+leaving it out; errors and warnings are the exception, since `coqc` would
+report them for this version of the file.
 """
 
 import errno
@@ -21,10 +35,24 @@ import time
 from . import diag as diagmod
 from . import protocol
 
-# `Set Silent.` is not cosmetic.  Printing a full Iris goal after each of a few
-# thousand sentences costs more than the proof does; without it the REPL runs
-# ~3x slower than coqc and the whole idea collapses.  It leaves `-time`'s Chars
-# lines, the prompts, warnings and errors alone.
+# `Set Silent.` does not mean what its name suggests, and what it does depends
+# on the version.  It sets `Flags.quiet`, which gates two different things: the
+# goal `coqloop` prints after every sentence that changed the proof, and the
+# `if_verbose` messages ("foo is defined").  It does NOT gate what a sentence
+# prints on request: `Show`, `Check` and the `Print` family (`Print
+# Assumptions` among them) go through `msg_notice`, which `Flags.quiet` has
+# never touched -- checked in `vernac/vernacentries.ml` at both 9.0 and 9.2.
+# `Time`'s "Finished transaction" was not traced to its emitter, so do not
+# count on it under a version where the option bites.
+#
+# On 9.0 and 9.1 it gates both, and the goal print is the expensive one:
+# formatting a full Iris goal after each of a few thousand sentences costs more
+# than the proof does, and without this the REPL runs about 3x slower than
+# `coqc`.  On 9.2 it gates neither -- the option no longer takes effect when
+# set from the REPL, and the goal print is skipped for `-emacs` clients however
+# it is set.  So this line is load-bearing on 9.0/9.1 and a no-op on 9.2, and
+# either way it costs us nothing we want: a check reports what its sentences
+# printed because it stops FILTERING that output, not because of this.
 PROLOGUE = b"Set Silent.\n"
 
 # A sentinel must PARSE (a parse error emits no Chars line at all), execute,
@@ -72,12 +100,11 @@ class MemoryLimit(Exception):
 
 class Session:
     def __init__(self, path, flags, cwd=None, write_ahead=DEFAULT_WRITE_AHEAD,
-                 silent=True, env=None, rss_limit=None, rocq="rocq"):
+                 env=None, rss_limit=None, rocq="rocq"):
         self.path = os.path.abspath(path)
         self.flags = list(flags)
         self.cwd = cwd or os.path.dirname(self.path)
         self.write_ahead = write_ahead
-        self.silent = silent
         self.env = env
         # The absolute `rocq` the CLIENT resolved, not whatever is on the
         # daemon's PATH.  A daemon outlives the shell that started it, and on a
@@ -131,8 +158,7 @@ class Session:
         self._await(lambda: protocol.PROMPT_RE.search(self.buf) is not None,
                     timeout=120, what="banner")
         self._trim_to_last_prompt()
-        if self.silent:
-            self._feed_raw(PROLOGUE, timeout=120)
+        self._feed_raw(PROLOGUE, timeout=120)
 
     def stop(self):
         if self.proc is None:
@@ -771,13 +797,18 @@ class Session:
                 first_bad = i
                 break
         good = items[:first_bad] if first_bad is not None else items
-        self.sentences.extend(s for s in good if isinstance(s, protocol.Sentence))
         # Warnings from the REUSED prefix have to be reported too.  A warm run
         # never re-executes those sentences, so without this a replay silently
         # drops every warning above the edit and stops matching `coqc`.
         diags = self._prefix_diags()
-        if first_bad is not None:
-            diags += _diags_of(items[first_bad], include_info=not self.silent)
+        # Then everything this check executed, in the order Rocq printed it,
+        # output and all -- the `Show` the user added to see the stuck goal is
+        # in here, and so is whatever the failing sentence printed on its way
+        # out.
+        executed = items if first_bad is None else items[:first_bad + 1]
+        for it in executed:
+            diags += _diags_of(it, include_info=True)
+        self.sentences.extend(s for s in good if isinstance(s, protocol.Sentence))
         if first_bad is None:
             self.text = text
             self.complete = True
@@ -793,15 +824,18 @@ class Session:
                            total=len(self.sentences))
 
     def _prefix_diags(self):
-        """Every message the sentences we are keeping produced.
+        """The errors and warnings of the sentences we are keeping.
 
-        Errors and warnings always; the proof's own output only when the
-        session was started without `Set Silent`, since otherwise Rocq never
-        printed it in the first place.
+        Not their output.  A warm run does not re-execute the prefix, so
+        nothing in it printed anything this time round; replaying what it
+        printed several edits ago, next to a goal the session has just
+        computed, is worse than leaving it out.  Errors and warnings are
+        different -- `coqc` would report them for this version of the file,
+        and a replay that dropped them would stop matching it.
         """
         out = []
         for s in self.sentences:
-            out += _diags_of(s, include_info=not self.silent)
+            out += _diags_of(s)
         return out
 
     def _backtrack(self, state):
@@ -888,12 +922,10 @@ def _split_messages(raw):
     its own `<infomsg>...</infomsg>`.  Splitting on the location line alone
     lets an info message that Rocq printed right after a warning ride along
     inside the warning's blob, where it is classified as a warning and
-    rendered as part of it.  `Set Silent` hid those infomsgs on Rocq 9.0/9.1
-    so it never showed; 9.2 prints them even under Silent, so a warm run
-    reported a "foo is defined" line that a batch `coqc` never does.  Honour
-    the `<infomsg>` boundaries Rocq already gives us, and each becomes the
-    info blob it is -- dropped under `Set Silent`, never merged into a
-    warning.
+    rendered as part of it.  Honour the `<infomsg>` boundaries Rocq already
+    gives us, and each becomes the info blob it is -- reported as the output
+    it is when we just ran the sentence, dropped when it is a cached one's,
+    and never merged into a warning.
     """
     if not raw or not raw.strip():
         return []

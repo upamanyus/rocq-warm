@@ -26,16 +26,30 @@ a live Rocq by the test suite, never assumed:
    signal. Grepping the output for `Error:` is not: a proof's own `idtac` can
    print anything. A *parse* error is the one case that emits no `Chars` line
    at all — Rocq reports it, skips to the next `.`, and carries on.
-4. **`BackTo <id>` restores the whole system state** — verified for `Require`
-   (the names go away again), `Notation` (the *parser* is restored), `Ltac`,
-   and `Set`/`Unset`. That is what makes the prefix genuinely reusable rather
-   than merely "probably fine".
 
-`Set Silent.` is not cosmetic. Printing a full proof goal after each of a few
-thousand sentences costs more than the proof does; without it the REPL runs
-about 3x slower than `coqc`. It leaves the `Chars` lines, the prompts, warnings
-and errors alone — but it does drop everything the proof itself prints, which
-is why `--show-output` exists and why it starts a fresh session.
+`Set Silent.` does not mean what its name suggests, and what it does depends on
+the version. It sets `Flags.quiet`, which gates two things: the goal `coqloop`
+prints after every sentence that changed the proof, and the `if_verbose`
+messages (`foo is defined`). It does **not** gate what a sentence prints on
+request: `Show`, `Check` and the `Print` family go through `msg_notice`, which
+`Flags.quiet` has never touched (checked in `vernac/vernacentries.ml` at 9.0
+and 9.2). `Time`'s "Finished transaction" was not traced to its emitter, so it
+is not relied on where the option bites.
+
+On 9.0/9.1 it gates both, and the goal print is the expensive one: a full Iris
+goal after each of a few thousand sentences costs more than the proof does, and
+without it the REPL runs about 3x slower than `coqc`. On 9.2 it gates neither —
+the option no longer takes effect when set from the REPL, and 9.2 skips the
+goal print for `-emacs` clients however it is set (`if not !print_emacs`, a
+guard 9.0/9.1 do not have). So the prologue is load-bearing on 9.0/9.1 and a
+no-op on 9.2, and it costs nothing either way: what a check reports is what its
+sentences printed, and it gets that by no longer FILTERING that output, not by
+asking Rocq for more.
+
+Only the executed sentences' output is reported. The prefix printed nothing
+this time round, and a goal from three edits ago next to a fresh one is worse
+than no goal at all. Errors and warnings are re-emitted for the whole file
+regardless, since `coqc` would report them for this version of it.
 
 One parsing detail that bites: the bracketed display is **not escaped**, and
 proof scripts are full of `]` (`iDestruct ... as "[H1 H2]"`). The `Chars`
@@ -93,8 +107,8 @@ which was found by looking rather than by reasoning:
 
 So the set watched is now **what Rocq says it loaded**: after every check the
 session is asked `Print Libraries.` and, for any name not yet mapped, `Locate
-Library X.`, which prints the physical `.vo`. Both work under `Set Silent`,
-inside a proof, and cost tens of milliseconds for a few hundred libraries; the
+Library X.`, which prints the physical `.vo`. Both work inside a proof, and
+cost tens of milliseconds for a few hundred libraries; the
 queries are undone with `BackTo` so the session is parked exactly where it
 was. The `rocq dep` closure is still unioned in, so nothing is lost if the
 answer is ever short.
@@ -281,8 +295,11 @@ Two things it has to be careful about, both learned the hard way:
   else's housekeeping into a reported disagreement. Retry before believing it.
   The same applies to a session dying: the death note names the signal (9 is
   the OOM killer, 6 is Rocq aborting on its own, 15 is somebody else).
-- **`Set Silent` drops `Time`'s "Finished transaction in …"**, the one piece of
-  non-diagnostic chatter `coqc` also prints. Strip it before comparing; a
+- **Only diagnostics can be compared.** A check reports what the sentences it
+  executed printed, and that is not what a batch compile prints: a REPL says
+  `foo is defined` where `coqc` says nothing, and a warm run does not re-print
+  what its reused prefix printed. So the comparison is over errors and
+  warnings, and `coqc`'s own `Time` chatter is stripped from its side — a
   timing is not a verdict, and a warm run has no meaningful one to give.
 
 ### The one place it cannot match `coqc`
@@ -294,3 +311,6 @@ ended up ahead of the position it names. There is no right answer to reproduce,
 so `rocq-warm` reports it at its own reading and the corpus runner compares
 that warning's presence but not its location. Everything else — every error,
 every other warning — matches `coqc` byte for byte.
+
+A proof's own output is deliberately not held to that standard, because it
+cannot be: see the bullet above.

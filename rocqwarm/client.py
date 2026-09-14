@@ -121,7 +121,7 @@ def cmd_check(args):
     rocq, env = rocq_environment()
     display = os.path.relpath(path, root)
     resp = request(root, {"cmd": "check", "path": path, "cold": args.cold,
-                          "timeout": args.timeout, "verbose": args.show_output,
+                          "timeout": args.timeout,
                           "rocq": rocq, "env": env,
                           "allow_stale": args.allow_stale,
                           "rebuild": args.rebuild,
@@ -257,9 +257,6 @@ def main(argv=None):
     c.add_argument("--allow-stale", action="store_true",
                    help="check even if a dependency's .vo is older than its "
                         "source (the verdict is then about the OLD library)")
-    c.add_argument("--show-output", action="store_true",
-                   help="also print what the proof itself prints (goals, Time, "
-                        "Print Assumptions); much slower on Iris proofs")
     c.set_defaults(func=cmd_check)
 
     s = sub.add_parser("status", help="what the daemon is holding")

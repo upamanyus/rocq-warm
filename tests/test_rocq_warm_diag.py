@@ -183,34 +183,36 @@ class InfoMessageSplitTests(unittest.TestCase):
     """`-emacs` tags every info message with <infomsg>...</infomsg>.  When
     Rocq prints one right after a warning -- a definition's "foo is defined"
     after a deprecation warning -- it must be its own blob, or it rides along
-    inside the warning and gets rendered as part of it.  `Set Silent` hid
-    these on Rocq 9.0/9.1; 9.2 prints them even under Silent, so this is
-    pinned directly on the splitter rather than only through a live Rocq.
+    inside the warning and gets rendered as part of it.
+
+    `include_info` is what separates a sentence this check executed, whose
+    output is reported, from a cached one, whose is not; both shapes are
+    pinned here on the splitter directly rather than only through a live Rocq.
     """
 
-    def diags(self, blob, silent):
+    def diags(self, blob, cached):
         return session_mod._diags_of(
-            _Item(blob), include_info=not silent)
+            _Item(blob), include_info=not cached)
 
     def test_an_infomsg_after_a_warning_is_a_separate_blob(self):
         blob = (b"Toplevel input, characters 0-21:\n"
                 b"<warning>\nWarning: Reference old is deprecated. use new\n"
                 b"[deprecated-reference,deprecated,default]\n</warning>\n"
                 b"<infomsg>use is defined</infomsg>")
-        # Under Set Silent (the default), only the warning survives.
-        silent = self.diags(blob, silent=True)
-        self.assertEqual([d.kind for d in silent], ["warning"])
-        self.assertNotIn(b"is defined", silent[0].message())
-        self.assertIn(b"deprecated", silent[0].message())
-        # Asked for info too, the "is defined" comes back as its own info diag.
-        loud = self.diags(blob, silent=False)
+        # For a cached sentence, only the warning survives.
+        cached = self.diags(blob, cached=True)
+        self.assertEqual([d.kind for d in cached], ["warning"])
+        self.assertNotIn(b"is defined", cached[0].message())
+        self.assertIn(b"deprecated", cached[0].message())
+        # For one we just ran, the "is defined" is its own info diag.
+        loud = self.diags(blob, cached=False)
         self.assertEqual([d.kind for d in loud], ["warning", "info"])
         self.assertIn(b"use is defined", loud[1].message())
 
     def test_a_lone_infomsg_is_info(self):
         blob = b"<infomsg>old is defined</infomsg>"
-        self.assertEqual(self.diags(blob, silent=True), [])
-        loud = self.diags(blob, silent=False)
+        self.assertEqual(self.diags(blob, cached=True), [])
+        loud = self.diags(blob, cached=False)
         self.assertEqual([d.kind for d in loud], ["info"])
 
     def test_two_infomsgs_around_a_warning_stay_three_blobs(self):
@@ -218,9 +220,9 @@ class InfoMessageSplitTests(unittest.TestCase):
                 b"Toplevel input, characters 0-5:\n"
                 b"<warning>\nWarning: something [w,default]\n</warning>\n"
                 b"<infomsg>b is defined</infomsg>")
-        self.assertEqual([d.kind for d in self.diags(blob, silent=False)],
+        self.assertEqual([d.kind for d in self.diags(blob, cached=False)],
                          ["info", "warning", "info"])
-        self.assertEqual([d.kind for d in self.diags(blob, silent=True)],
+        self.assertEqual([d.kind for d in self.diags(blob, cached=True)],
                          ["warning"])
 
 

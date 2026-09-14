@@ -73,7 +73,6 @@ rocq-warm check FILE.v --cold   # ignore any warm session
 rocq-warm check FILE.v --compile        # on success, also write the .vo (a real rocq compile)
 rocq-warm check FILE.v --rebuild        # first compile any stale dependency, in order
 rocq-warm check FILE.v --allow-stale    # check against stale dependencies anyway (warns)
-rocq-warm check FILE.v --show-output    # also print what the proof prints
 rocq-warm status                # what the daemon is holding
 rocq-warm stop                  # free the sessions
 ```
@@ -81,6 +80,29 @@ rocq-warm stop                  # free the sessions
 Exit codes: 0 the file checks, 1 it does not, 2 it could not be checked (a
 stale dependency, no daemon, no `rocq`), 3 a green verdict that a real
 `rocq compile` then rejected -- a bug in rocq-warm, please report it.
+
+### What it prints
+
+Diagnostics in `coqc`'s format, and **whatever the sentences it executed
+printed**: the `Show.` you added to see where the proof is stuck, a `Check`, a
+`Print Assumptions`. There is no flag for this and no fresh session to pay for
+-- adding a `Show.` to a file and re-checking it is a replay like any other,
+and it asks nothing extra of Rocq, which was printing all of this along.
+
+The session still issues `Set Silent.`, which is what keeps Rocq from printing
+a goal after every sentence (a real cost on 9.0/9.1, and already off for
+`-emacs` clients on 9.2). It does not touch query output, so a `Show.` is
+answered on every version; what it does hide on 9.0/9.1 is the handful of
+messages Rocq routes through `if_verbose`, `foo is defined` among them -- which
+a batch `coqc` does not print either.
+
+What you do not get is the output of the sentences it did **not** execute. The
+reused prefix printed nothing this time round, and replaying what it printed
+several edits ago, next to a goal the session has just computed, is worse than
+leaving it out -- so a check that re-executes nothing (an unchanged file, or a
+comment-only edit) prints nothing. Errors and warnings are the exception: those
+are re-emitted for the whole file, because `coqc` would report them for this
+version of it.
 
 `--compile` and `--rebuild` run the build's own step -- `rocq compile` with
 the flags from the nearest `_CoqProject`, writing the `.vo` where `make`
@@ -128,7 +150,7 @@ changes on disk (the set is what Rocq itself reports having loaded -- the
 standard library and installed packages included, and a `Require` added by a
 later edit); a `.vo` changes *while* a check is running, in which case the
 verdict is reported and the session dropped; the
-`rocq` you invoke with changes; `--cold` or `--show-output` is passed; it
+`rocq` you invoke with changes; `--cold` is passed; it
 falls out of the LRU under the session-count or memory budget; it goes
 untouched for the idle timeout; it exceeds its own RSS ceiling mid-check; or
 the check exceeds its wall timeout.
@@ -220,14 +242,20 @@ $ tests/rocq_warm_corpus.py --dir proofs --jobs 6 --spread 24
 Those are minutes-long compiles: run it on a big machine, and give it
 `--rss-limit-gb` room.
 
-### The one place it cannot match `coqc`
+### Where it cannot match `coqc`
 
-The `comment-terminator-in-string` warning (a `"` inside a comment) is reported
-at a location Rocq computes wrongly in batch mode too — `coqc` itself prints a
+Diagnostics match `coqc` byte for byte, with one exception: the
+`comment-terminator-in-string` warning (a `"` inside a comment) is reported at
+a location Rocq computes wrongly in batch mode too — `coqc` itself prints a
 **negative** column for it. There is no right answer to reproduce, so
 `rocq-warm` reports it at its own reading and the corpus runner compares that
-warning's presence but not its location. Everything else matches `coqc` byte
-for byte.
+warning's presence but not its location.
+
+A proof's own output is close but not identical, and cannot be. A REPL prints
+`foo is defined` for a definition and a batch `coqc` does not, so those lines
+appear in a check and not in a build log; and the prefix a warm session reuses
+does not re-print what it printed when it ran. The verdict and the diagnostics
+are the part that is held to `coqc` exactly.
 
 ## Status
 

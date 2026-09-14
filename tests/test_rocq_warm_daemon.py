@@ -73,18 +73,40 @@ class DaemonTests(unittest.TestCase):
         self.assertIn(b"replay", again.stderr,
                       "a separate process should have found the parked session")
 
-    def test_the_proof_s_own_output_is_suppressed_unless_asked_for(self):
-        """Printing an Iris goal after every sentence costs more than the proof
-        does, so `Set Silent` is on by default -- which also drops `Time`'s
-        "Finished transaction".  Diagnostics are never suppressed."""
-        text = GOOD + b"\nTime Check 1.\n"
+    def test_the_output_of_what_it_executed_is_shown_with_no_flag(self):
+        """What the proof prints comes back, and from a WARM session.
+
+        This is what `--show-output` used to be for, and the reason it is gone:
+        it started a fresh session, so adding a `Show.` to a file to see where
+        it is stuck cost a cold run of the whole file -- exactly the cost
+        rocq-warm exists to avoid.
+
+        `Check` is the probe rather than `Time`, deliberately: it prints
+        through `Feedback.msg_notice`, which `Set Silent` has never gated on
+        any 9.x, so this asserts the same thing on every version the CI runs.
+        """
+        text = GOOD + b"\nCheck 1.\n"
         self.ws.write(self.NAME, text)
-        quiet = self.check()
-        self.assertEqual(quiet.returncode, 0, quiet.stderr)
-        self.assertNotIn(b"Finished transaction", quiet.stdout)
-        loud = self.run_cli("check", self.NAME, "--show-output")
-        self.assertEqual(loud.returncode, 0, loud.stderr)
-        self.assertIn(b"Finished transaction", loud.stdout)
+        first = self.check()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn(b": nat", first.stdout)
+
+        # Executing nothing prints nothing -- and does not throw the session
+        # away in order to say so.
+        again = self.check()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotIn(b": nat", again.stdout)
+        self.assertIn(b"replay", again.stderr)
+
+        # Edit above it and it is executed again, so its output is back.  Still
+        # a replay: showing output costs no session.  (Not the file's FIRST
+        # sentence -- an edit there has no prefix to keep and cold-starts.)
+        self.ws.write(self.NAME, text.replace(b"Lemma two : 1 = 1.",
+                                              b"Lemma two : 2 = 2."))
+        edited = self.run_cli("check", self.NAME)
+        self.assertEqual(edited.returncode, 0, edited.stderr)
+        self.assertIn(b": nat", edited.stdout)
+        self.assertIn(b"replay", edited.stderr)
 
     def test_status_lists_the_session_and_stop_clears_it(self):
         self.check()

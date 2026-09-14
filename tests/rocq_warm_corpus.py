@@ -51,11 +51,10 @@ VERNAC_HEAD = re.compile(
     rb'|Context|Variable|Hypothesis|Local|Global|Set|Unset|Hint|Arguments)\b')
 
 
-# `rocq-warm` runs under `Set Silent`, which drops everything that is not a
-# diagnostic -- goals, "x is defined", and `Time`'s "Finished transaction in
-# ...".  That last one is the only such line `coqc` also prints, so strip it
-# before comparing: a timing is not a verdict, and a warm run has no meaningful
-# one to give.
+# Only errors and warnings are compared with `coqc`'s -- a check also reports
+# what the sentences it executed printed, which is not what a batch compile
+# prints -- so the one thing left to strip from `coqc`'s side is its timings: a
+# timing is not a verdict, and a warm run has no meaningful one to give.
 CHATTER = re.compile(r'^Finished (failing )?transaction in ')
 HEADER = re.compile(r'^File "[^"]*", line \d+, characters -?\d+--?\d+:$')
 # Rocq's location for this lexer warning is broken in batch mode too -- `coqc`
@@ -240,7 +239,8 @@ def _check_file_once(path, timeout, keep_going, rss_limit=None):
                     scratch, scratch_flags, cwd, out_dir, timeout)
             got = sess.check(version, timeout=timeout)
             got_diags = normalize("\n".join(
-                d.render(name, version) for d in got.diags))
+                d.render(name, version) for d in got.diags
+                if d.kind != "info"))
             step = {"step": label, "mode": got.mode,
                     "replayed": got.replayed, "sentences": got.total,
                     "rocq-warm_seconds": round(got.seconds, 1),

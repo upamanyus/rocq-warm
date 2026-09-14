@@ -162,7 +162,7 @@ class Server:
                 self.graphs[key] = g
         return g
 
-    def _stale_entry(self, entry, flags, toolchain, force_cold, silent):
+    def _stale_entry(self, entry, flags, toolchain, force_cold):
         """Why `entry` cannot be reused now, or None if it can."""
         if entry.flags != flags:
             return "the build flags changed"
@@ -170,11 +170,11 @@ class Server:
             return "a different Rocq / opam switch"
         if entry.loaded_changed():
             return "a dependency was rebuilt"
-        if force_cold or not entry.sess.alive or entry.sess.silent != silent:
+        if force_cold or not entry.sess.alive:
             return "cold"
         return None
 
-    def _entry(self, path, force_cold=False, silent=True, toolchain=None):
+    def _entry(self, path, force_cold=False, toolchain=None):
         """The warm session for `path`, cold-started if anything moved.
 
         The whole get-or-create runs under `self.lock`, so there is exactly
@@ -193,7 +193,7 @@ class Server:
         with self.lock:
             entry = self.sessions.get(key)
             if entry is not None and self._stale_entry(
-                    entry, flags, toolchain, force_cold, silent):
+                    entry, flags, toolchain, force_cold):
                 # Replace it -- but only actually stop it if nobody is using
                 # it right now.  A session mid-check holds its own lock; tearing
                 # its process out from under the check is the very race this
@@ -207,7 +207,7 @@ class Server:
             if entry is None:
                 rocq, env = self._toolchain_env(toolchain)
                 sess = session_mod.Session(
-                    key, flags, cwd=cwd, silent=silent, rocq=rocq, env=env,
+                    key, flags, cwd=cwd, rocq=rocq, env=env,
                     rss_limit=_session_ceiling(self.budget, self.max_sessions))
                 entry = Entry(sess, flags, cwd, toolchain)
                 self.sessions[key] = entry
@@ -389,7 +389,6 @@ class Server:
                         len(stale), "y" if len(stale) == 1 else "ies")}
 
         entry = self._entry(path, force_cold=bool(req.get("cold")),
-                            silent=not bool(req.get("verbose")),
                             toolchain=toolchain)
         # Everything we know the session holds or is about to load, stat'ed
         # BEFORE it loads anything.  A .vo rebuilt while the check runs must
