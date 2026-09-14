@@ -108,6 +108,34 @@ class DaemonTests(unittest.TestCase):
         self.assertIn(b": nat", edited.stdout)
         self.assertIn(b"replay", edited.stderr)
 
+    def test_a_bare_show_is_not_a_syntax_error(self):
+        """The command you reach for when a proof is stuck, and it used to fail
+        the file.
+
+        `rocq repl` parses at the `vernac_toplevel` entry, and since Rocq 9.2
+        `coqloop` answers a bare `Show.` itself rather than putting it in the
+        document: no new state id, and no `-time` range.  Both are how
+        rocq-warm recognises a parse error, so the file came back FAILED while
+        `coqc` compiled it happily.  On 9.0 and 9.1 `Show.` goes through the
+        document and always worked; this passes there for that reason, and the
+        same shape reaches 9.0 through `Show Proof Diffs.`.
+        """
+        text = b"""Lemma stuck : True /\\ True.
+Proof.
+  split.
+  Show.
+  - exact I.
+  - exact I.
+Qed.
+"""
+        self.ws.write(self.NAME, text)
+        got = self.check()
+        rc, _cold = self.ws.coqc(self.NAME)
+        self.assertEqual(rc, 0, "the reference coqc rejected the file")
+        self.assertEqual(got.returncode, 0,
+                         "%s / %s" % (got.stdout, got.stderr))
+        self.assertIn(b"2 goals", got.stdout)
+
     def test_status_lists_the_session_and_stop_clears_it(self):
         self.check()
         st = self.run_cli("status", "--root", self.ws.dir)

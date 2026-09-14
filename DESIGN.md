@@ -24,8 +24,26 @@ a live Rocq by the test suite, never assumed:
    `Set`, `Section`/`Module`, bullets, `Fail`, `Qed`.
 3. **A failed sentence does not advance the state id.** That is the verdict
    signal. Grepping the output for `Error:` is not: a proof's own `idtac` can
-   print anything. A *parse* error is the one case that emits no `Chars` line
-   at all — Rocq reports it, skips to the next `.`, and carries on.
+   print anything. Two kinds of sentence emit no `Chars` line at all, and a
+   standing state id therefore does not distinguish them: a *parse* error —
+   Rocq reports it, skips to the next `.`, and carries on — and a
+   **toplevel-only** command. `rocq repl` parses at the `vernac_toplevel`
+   entry, and `coqloop` answers those itself rather than putting them in the
+   document: `Drop`, `Quit`, `BackTo`, `Show Goal N at M`, `Show Proof Diffs`,
+   and, **since 9.2**, a bare `Show.` (`Show N.`, `Show Diffs id.`). It prints
+   the goal and hands back the state it was given. A batch `coqc` parses at
+   the plain `vernac` entry, where all of these are ordinary commands — which
+   is why `coqc` accepts a file whose `Show.` the REPL would otherwise make
+   look like a syntax error. On 9.0 and 9.1 a bare `Show.` went through the
+   document and got a range like anything else; 9.2 moved it into this
+   grammar, which is what made the common case visible. For a `Chars`-less
+   segment, and only there, the verdict comes from whether Rocq printed an
+   `Error:`; an `idtac` cannot print one from a sentence that never reached
+   the document.
+4. **`BackTo <id>` restores the whole system state** — verified for `Require`
+   (the names go away again), `Notation` (the *parser* is restored), `Ltac`,
+   and `Set`/`Unset`. That is what makes the prefix genuinely reusable rather
+   than merely "probably fine".
 
 `Set Silent.` does not mean what its name suggests, and what it does depends on
 the version. It sets `Flags.quiet`, which gates two things: the goal `coqloop`

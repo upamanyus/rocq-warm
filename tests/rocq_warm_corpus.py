@@ -261,6 +261,11 @@ def _check_file_once(path, timeout, keep_going, rss_limit=None):
             if report["failures"] and not keep_going:
                 break
             if label == "cold":
+                # On 9.2, a file with a bare `Show.` in it would report one
+                # range fewer here: `coqc` puts it in the document and `-time`
+                # reports its range, while `rocq repl` answers it in coqloop
+                # and reports none, so the session has no sentence for it.
+                # No corpus file has one; if one ever does, that is why.
                 got_ranges = [(s.start, s.end) for s in sess.sentences]
                 if got_ranges != ranges:
                     report["failures"].append(

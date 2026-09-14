@@ -87,6 +87,39 @@ class LocationTests(unittest.TestCase):
         self.assertSameAsCoqc(
             b"Lemma z : False.\nProof. exact bogus. Qed.\n", "shared line")
 
+    def assertSameDiagnosticAsCoqc(self, text, label):
+        """As `assertSameAsCoqc`, for a file that also PRINTS something.
+
+        `coqc` puts the goal a `Show.` asked for in the same stream as its
+        diagnostics, and `render_all` compares diagnostics only, so cut
+        `coqc`'s output at the first one.
+        """
+        path = self.ws.write(self.NAME, text)
+        sess = session_mod.Session(path, self.ws.flags, cwd=self.ws.dir)
+        sess.start()
+        self.addCleanup(sess.stop)
+        result = sess.check(text, timeout=300)
+        _rc, cold = self.ws.coqc(self.NAME)
+        self.assertIn('File "', cold, "%s: coqc reported no diagnostic" % label)
+        self.assertEqual(render_all(result, self.NAME, text),
+                         cold[cold.index('File "'):], label)
+
+    def test_error_after_a_bare_show(self):
+        """`-time` reports no range for a bare `Show.` -- `coqloop` answers it
+        without putting anything in the document -- so its range, and with it
+        the anchor every message below it is measured from, is reconstructed
+        rather than reported.  An error under one is how that is checked."""
+        self.assertSameDiagnosticAsCoqc(
+            PREAMBLE + b"Goal True.\n  Show.\n  exact bogus.\n",
+            "error below a Show")
+
+    def test_error_after_a_show_sharing_its_line(self):
+        """The shape that moves the anchor back onto the previous line, with a
+        sentence that has no range of its own in front of it."""
+        self.assertSameDiagnosticAsCoqc(
+            PREAMBLE + b"Goal True.\n  Show. exact bogus.\n",
+            "Show and the error on one line")
+
     def test_error_inside_a_multi_line_sentence(self):
         self.assertSameAsCoqc(
             PREAMBLE + b"\nDefinition l :=\n   plus\n     a\n     bogus.\n",

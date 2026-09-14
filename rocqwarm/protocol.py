@@ -19,8 +19,29 @@ Three facts about this stream carry the whole design, and each is checked by
   signal -- far more robust than grepping for `Error:` in output that a proof's
   own `idtac` may have written.
 
-A *parse* error is the one sentence kind that produces no `Chars` line at all:
-Rocq reports the error, skips to the next `.`, and carries on.
+Two sentence kinds produce no `Chars` line at all, and they must not be
+confused, because one is a failure and the other is the output the user asked
+for:
+
+* a *parse* error -- Rocq reports it, skips to the next `.`, and carries on;
+* a **toplevel-only** command.  `rocq repl` parses at the `vernac_toplevel`
+  grammar entry, and `coqloop` answers those itself instead of putting them
+  in the document: `Drop`, `Quit`, `BackTo`, `Show Goal N at M`, `Show Proof
+  Diffs`, and -- since Rocq 9.2 -- a bare `Show.`, `Show N.` and `Show Diffs
+  id.`.  It prints the goal and hands back the state it was given, so there
+  is no new state id and `-time` has nothing to report.  A batch `coqc`
+  parses the same file at the plain `vernac` entry, where every one of these
+  is an ordinary command, which is why `coqc` accepts a file the REPL would
+  otherwise look like it had rejected.  On 9.0 and 9.1 a bare `Show.` went
+  through the document and did get a range; 9.2 moving it into this grammar
+  is what made the common case of this visible.
+
+So for a Chars-less segment the verdict cannot come from the state id, which
+is unchanged either way; it comes from whether Rocq printed an error.  That is
+the one place this parser reads the message text to decide a verdict, and it is
+sound here for the reason it is unsound in general: a proof's own `idtac` can
+print "Error:" but cannot do it from a sentence that never reached the
+document.
 """
 
 import re
@@ -40,6 +61,10 @@ CHARS_RE = re.compile(
 # per-sentence segments.  Progress tracking works on the raw stream and must
 # therefore not anchor.
 PROGRESS_RE = re.compile(rb'Chars (\d+) - (\d+) \[')
+# Rocq's own report that a sentence failed.  Only ever consulted for a segment
+# with no `Chars` line, where the state id cannot tell a parse error apart from
+# a toplevel-only command; see the note at the top of this file.
+ERROR_RE = re.compile(rb'(?m)^Error:')
 
 
 class Sentence:
@@ -72,28 +97,31 @@ class Sentence:
             self.state_before, " FAILED" if self.failed else "")
 
 
-class ParseFailure:
-    """A sentence Rocq could not even parse: no `Chars` line, no state change.
+class Untimed:
+    """A sentence Rocq executed and reported no `Chars` line for.
 
-    Rocq skips to the next `.` and keeps going, so this carries no range of its
-    own; `Session` reconstructs one from the surrounding sentences.
+    Either a parse error or a toplevel-only command -- see the note at the top
+    of this file.  Neither has a range of its own, so `Session` reconstructs
+    one from the surrounding sentences, and neither advances the state id.
     """
 
-    __slots__ = ("state_before", "messages", "start", "end", "anchor")
+    __slots__ = ("state_before", "messages", "failed", "start", "end", "anchor")
 
-    def __init__(self, state_before, messages):
+    def __init__(self, state_before, messages, failed):
         self.state_before = state_before
         self.messages = messages
+        self.failed = failed
         self.start = None
         self.end = None
         self.anchor = None
 
     state_after = property(lambda self: self.state_before)
-    failed = property(lambda self: True)
-    display = property(lambda self: b"<parse error>")
+    display = property(
+        lambda self: b"<parse error>" if self.failed else b"<toplevel command>")
 
     def __repr__(self):
-        return "ParseFailure(%s-%s)" % (self.start, self.end)
+        return "Untimed(%s-%s%s)" % (self.start, self.end,
+                                     " FAILED" if self.failed else "")
 
 
 def split_prompts(buf):
@@ -124,12 +152,13 @@ def split_prompts(buf):
 
 
 def parse_segments(segments):
-    """Turn segments into Sentence / ParseFailure objects."""
+    """Turn segments into Sentence / Untimed objects."""
     out = []
     for state_before, state_after, seg in segments:
         m = CHARS_RE.search(seg)
         if m is None:
-            out.append(ParseFailure(state_before, seg))
+            out.append(Untimed(state_before, seg,
+                               failed=ERROR_RE.search(seg) is not None))
             continue
         messages = (seg[:m.start()] + seg[m.end():])
         out.append(Sentence(int(m.group(1)), int(m.group(2)), m.group(3),
@@ -147,7 +176,7 @@ def message_text(raw):
 
 def classify(raw):
     """'error', 'warning' or 'info' for one message blob."""
-    if re.search(rb'(?m)^Error:', raw):
+    if ERROR_RE.search(raw):
         return "error"
     if b"<warning>" in raw or re.search(rb'(?m)^Warning:', raw):
         return "warning"

@@ -44,14 +44,28 @@ class ChunkParsingTests(unittest.TestCase):
         self.assertFalse(items[0].failed)
         self.assertTrue(items[1].failed)          # state did not advance
 
-    def test_a_segment_without_a_chars_line_is_a_parse_failure(self):
+    def test_a_chars_less_segment_with_an_error_is_a_parse_failure(self):
         raw = (b'<prompt>Rocq < 1 || 0 < </prompt>Chars 0 - 5 [A.] 0. secs (0.u,0.s)\n'
                b'<prompt>Rocq < 2 || 0 < </prompt>Toplevel input, characters 1-2:\n'
                b'Error: Syntax error\n'
                b'<prompt>Rocq < 2 || 0 < </prompt>')
         items = protocol.parse_segments(protocol.split_prompts(raw)[0])
-        self.assertIsInstance(items[1], protocol.ParseFailure)
+        self.assertIsInstance(items[1], protocol.Untimed)
         self.assertTrue(items[1].failed)
+
+    def test_a_chars_less_segment_without_an_error_is_not_a_failure(self):
+        """A toplevel-only command -- `Show Proof Diffs.`, or on 9.2 a bare
+        `Show.` -- is answered by `coqloop` itself: nothing enters the
+        document, so there is no new state id and `-time` reports no range.
+        Reading that as a parse error fails a file `coqc` compiles."""
+        raw = (b'<prompt>Rocq < 1 || 0 < </prompt>Chars 0 - 5 [A.] 0. secs (0.u,0.s)\n'
+               b'<prompt>Unnamed_thm < 2 |branch| 0 < </prompt>1 goal (ID 3)\n'
+               b'  \n  ============================\n  True\n'
+               b'<prompt>Unnamed_thm < 2 |branch| 0 < </prompt>')
+        items = protocol.parse_segments(protocol.split_prompts(raw)[0])
+        self.assertIsInstance(items[1], protocol.Untimed)
+        self.assertFalse(items[1].failed)
+        self.assertIn(b"1 goal", items[1].messages)
 
 
 class BlankOrCommentTests(unittest.TestCase):

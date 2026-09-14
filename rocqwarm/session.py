@@ -496,12 +496,20 @@ class Session:
             Spotting that DURING the feed is what makes a broken proof cheap:
             otherwise Rocq happily re-proves the whole rest of the file behind
             an error we already know about.
+
+            A standing state id is necessary but not sufficient: a bare
+            `Show.` -- which `coqloop` answers itself, without putting anything
+            in the document -- leaves it standing too, and stopping the feed
+            there would abandon the check over the goal the user asked to see.
+            So require Rocq's own `Error:` in the same segment.  Sound for the
+            same reason it would be unsound as a general verdict signal: a
+            proof's own `idtac` can print "Error:", but a sentence that prints
+            anything at all has advanced the state id.
             """
-            states = [int(m.group(2))
-                      for m in (protocol.PROMPT_BODY_RE.match(p.group(1))
-                                for p in protocol.PROMPT_RE.finditer(self.buf))
-                      if m is not None]
-            return any(a == b for a, b in zip(states, states[1:]))
+            for before, after, seg in protocol.split_prompts(self.buf)[0]:
+                if before == after and protocol.ERROR_RE.search(seg):
+                    return True
+            return False
 
         deadline = time.time() + timeout
         last_ticks = self._cpu_ticks()
@@ -588,8 +596,9 @@ class Session:
                 it.end = it.stream_end - base + file_start
         prev_end = None
         for i, it in enumerate(items):
-            if isinstance(it, protocol.ParseFailure):
-                # A parse error has no Chars line and so no range of its own.
+            if not isinstance(it, protocol.Sentence):
+                # No Chars line, so no range of its own: a parse error, or a
+                # toplevel-only command such as a bare `Show.`.
                 it.start = diagmod.skip_blanks(
                     text, file_start if prev_end is None else prev_end)
                 it.end = file_end
@@ -804,7 +813,8 @@ class Session:
         # Then everything this check executed, in the order Rocq printed it,
         # output and all -- the `Show` the user added to see the stuck goal is
         # in here, and so is whatever the failing sentence printed on its way
-        # out.
+        # out.  A toplevel-only item (a bare `Show.`) never reaches the
+        # sentence map, so this list, not the map, is what carries it.
         executed = items if first_bad is None else items[:first_bad + 1]
         for it in executed:
             diags += _diags_of(it, include_info=True)
