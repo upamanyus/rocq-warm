@@ -298,6 +298,39 @@ class ConcurrentCheckTests(ServerCase):
         thread.join(timeout=300)
         self.assertTrue(out["result"].get("passed"), out["result"])
 
+    def test_a_slow_check_does_not_block_another_file(self):
+        """The claim the daemon exists for, and the reason one check per file
+        is a refusal rather than a queue: DIFFERENT files check in parallel.
+
+        Asserted structurally rather than by timing, which would be a race on
+        a loaded machine.  A file's slot stays borrowed for as long as its
+        proof runs, so a verdict for the quick file that arrives while the
+        slow file is still checked out can only have been reached alongside
+        it -- and two `rocq repl` were spawned to do it, which is what "in
+        parallel" has to mean.
+
+        This covers the checks themselves.  The pre-flight every check runs
+        before it borrows -- `graph.refresh`, behind one lock per project --
+        is shared and is deliberately not what this measures.
+        """
+        quick = self.ws.write("D.v", QUICK)
+        thread, out = self.in_background()          # C.v, the slow proof
+        self.wait_until_checking()
+
+        verdict = self.check(path=quick)
+        # Read before joining: afterwards the slow check is over either way.
+        still_running = self.borrowed(self.path)
+
+        self.assertTrue(verdict.get("passed"), verdict)
+        self.assertTrue(still_running,
+                        "the slow check finished before the quick one, so "
+                        "nothing here was concurrent -- SPIN is too fast")
+        # Cumulative, so eviction under memory pressure cannot mask it.
+        self.assertEqual(len(self.spawned), 2, self.spawned)
+
+        thread.join(timeout=300)
+        self.assertTrue(out["result"].get("passed"), out["result"])
+
     def test_a_cold_check_cannot_take_a_session_mid_check(self):
         """`--cold` is refused like anything else, and takes nothing.
 
