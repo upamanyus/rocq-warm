@@ -47,11 +47,10 @@ DEFAULT_IDLE_TIMEOUT = 1800.0
 DEFAULT_MAX_SESSIONS = 4
 DEFAULT_CHECK_TIMEOUT = 1800.0
 
-# How often a connection is looked at while its request runs, and how long its
-# watcher is given to notice that the request is over.  The poll costs one
-# `select` per connection per interval and decides how soon a Ctrl+C is acted
-# on, which is a small fraction of the time interrupting Rocq takes anyway.
-WATCH_POLL = 0.2
+# A bound on how long the request thread waits for its watcher to notice that
+# the request is over.  The notice is a closed fd, so this is never reached in
+# practice; it is here so that a watcher which somehow did not come back
+# cannot hold up the reply.
 WATCH_JOIN_TIMEOUT = 2.0
 
 
@@ -856,17 +855,22 @@ class Server:
         request it belongs to reads the event and stops, instead of proving a
         file for a process that no longer exists.  It is started after the
         request is read and joined before the connection is closed, so no
-        thread is ever left polling an fd the daemon has handed back to the
+        thread is ever left waiting on an fd the daemon has handed back to the
         kernel.
         """
-        gone, done = threading.Event(), threading.Event()
+        gone = threading.Event()
+        # The watcher waits on the connection and on this together, so closing
+        # our end is both "the request is over" and the wake-up that delivers
+        # it.  A socketpair rather than a flag because a flag cannot interrupt
+        # a blocked `select`, and waiting beats waking up to ask.
+        stop_r, stop_w = socket.socketpair()
         watcher = None
         try:
             req = recv_msg(conn)
             if req is None:
                 return
             watcher = threading.Thread(target=_watch_peer,
-                                       args=(conn, gone, done), daemon=True)
+                                       args=(conn, gone, stop_r), daemon=True)
             watcher.start()
             try:
                 resp = self.handle(req, cancelled=gone)
@@ -882,13 +886,18 @@ class Server:
             if req.get("cmd") == "stop":
                 os._exit(0)
         finally:
-            done.set()
+            # In this order, always: tell the watcher, wait for it to be gone,
+            # and only then close the fds it was waiting on.  Closing first
+            # would free fd numbers another thread can be handed while this
+            # one is still selecting on them.
+            stop_w.close()
             if watcher is not None:
                 watcher.join(timeout=WATCH_JOIN_TIMEOUT)
-            try:
-                conn.close()
-            except Exception:
-                pass
+            for sock in (stop_r, conn):
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
 
 def _describe_job(job):
@@ -899,7 +908,7 @@ def _describe_job(job):
     return d
 
 
-def _watch_peer(conn, gone, done, step=WATCH_POLL):
+def _watch_peer(conn, gone, stop):
     """Set `gone` when the client disappears before its reply.
 
     An interrupted client -- Ctrl+C, a closed terminal, a SIGKILL -- leaves
@@ -907,43 +916,49 @@ def _watch_peer(conn, gone, done, step=WATCH_POLL):
     the daemon gets that nobody is waiting any more.  Waiting for the client
     to say so instead would miss every way of dying that runs no code.
 
+    It waits for that rather than waking up to ask, and `stop` is what makes
+    blocking possible.  A thread blocked on the connection alone would still
+    be blocked once the request was over, and `close()` does not wake a
+    blocked reader: it would sit there until the fd number was reissued to
+    another thread, and then read somebody else's connection.  So
+    `_serve_one` closes its end of `stop` instead -- one action that ends this
+    thread and says why.  Which fd is ready cannot be mistaken, so "the
+    request is over" and "the client did something" are distinct by
+    construction rather than by the order two checks are written in.
+    `shutdown(SHUT_RD)` on the connection wakes it too and needs no second fd,
+    but it arrives looking exactly like a departed client, which is the one
+    thing this exists to recognise.
+
     The protocol is one request and one reply, so by the time this starts the
     client has sent everything it will ever send.  **Anything at all arriving
     on the connection therefore ends the request**: an EOF because the peer is
     gone, and bytes because a client speaking a protocol this daemon does not
-    have is not one to go on working for.  One rule, and no judgement about
-    which surprises are benign.
+    have is not one to go on working for.  Being strict is the cheap side of
+    that trade now that an abandoned check keeps its session -- a false
+    positive costs the couple of seconds the interrupt takes -- and it rules
+    out two worse shapes.  Dropping the bytes instead would let a second
+    message on this connection, a pipelined request or an explicit cancel, be
+    eaten in silence by the very thread that saw it; and a client that kept
+    writing would keep this readable, so a loop that consumed and carried on
+    would spin on a core for as long as the client cared to talk.
 
-    Treating stray bytes as a departure is the cheap side of the trade, now
-    that abandoning a check keeps its session: a false positive costs the
-    couple of seconds the interrupt takes and nothing else.  It also rules out
-    two worse shapes.  Discarding them instead would mean a second message on
-    this connection -- a pipelined request, an explicit cancel -- being eaten
-    in silence by the very thread that noticed it, where now it abandons the
-    check and says so in the log.  And a client that keeps writing would keep
-    this readable, so a loop that consumed and carried on would spin on a core
-    for as long as the client cared to talk.
-
-    The read itself stays, even though both outcomes mean the same thing,
+    The read is still made, though both outcomes now mean the same thing,
     because it is what makes the readability real: `select` may in principle
-    wake on nothing, and cancelling a live check is the one false positive
-    this must not produce.  `BlockingIOError` -- readable, then nothing there
-    -- is that case, and is the only way back into the loop.
+    wake on nothing, and cancelling a check whose client is still waiting is
+    the one false positive this must not produce.  `BlockingIOError` --
+    readable, then nothing there -- is that case, and the only way back into
+    the wait.
 
-    What this must NOT do is close the connection.  `_serve_one` still holds
-    it and has a reply to attempt on it; a close here frees an fd number that
-    another thread can be handed in the meantime, and the reply would land in
-    a stranger's socket.  The close belongs to the owner, and a reply to a
-    client that has gone already fails harmlessly.
-
-    Polled rather than left blocking in `recv`, so this thread is finished
-    before that close.  A `recv` still blocked on a closed fd would wake on
-    whatever the next thread put in its place.
+    What this must never do is close the connection.  `_serve_one` still holds
+    it and has a reply to attempt on it, and the fd numbers are only safe to
+    give back once this thread has returned, which is why the teardown there
+    is in the order it is.
     """
-    while not done.is_set():
+    while True:
         try:
-            if not select.select([conn], [], [], step)[0]:
-                continue
+            ready = select.select([conn, stop], [], [])[0]
+            if stop in ready:
+                return                  # the request is over; nothing to watch
             stray = conn.recv(4096, socket.MSG_DONTWAIT)
             if stray:
                 # Logged, because "the client went away" is about to be the

@@ -70,17 +70,19 @@ class PeerWatchTests(unittest.TestCase):
 
     def setUp(self):
         self.us, self.them = socket.socketpair()
-        self.addCleanup(self.us.close)
-        self.addCleanup(self.them.close)     # a test may have closed it already
-        self.gone, self.done = threading.Event(), threading.Event()
+        # The daemon's end of the request, and the pipe it says "done" down.
+        self.stop_r, self.stop_w = socket.socketpair()
+        for sock in (self.us, self.them, self.stop_r, self.stop_w):
+            self.addCleanup(sock.close)      # a test may have closed it already
+        self.gone = threading.Event()
 
-    def watch(self, step=0.01):
+    def watch(self):
         t = threading.Thread(target=server_mod._watch_peer,
-                             args=(self.us, self.gone, self.done),
-                             kwargs={"step": step}, daemon=True)
+                             args=(self.us, self.gone, self.stop_r),
+                             daemon=True)
         t.start()
         self.addCleanup(t.join, 5)
-        self.addCleanup(self.done.set)
+        self.addCleanup(self.stop_w.close)
         return t
 
     def test_a_client_that_is_still_waiting_is_left_alone(self):
@@ -88,11 +90,13 @@ class PeerWatchTests(unittest.TestCase):
 
         A client sends its request and then does nothing at all for as long
         as the proof takes, which to anything but the socket itself is
-        indistinguishable from being dead.
+        indistinguishable from being dead.  Nothing here has to be timed --
+        the watcher blocks -- so the wait is only to catch a spontaneous one.
         """
-        self.watch()
-        time.sleep(0.2)                         # many poll intervals
+        t = self.watch()
+        time.sleep(0.2)
         self.assertFalse(self.gone.is_set(), "cancelled a client that is there")
+        self.assertTrue(t.is_alive(), "the watcher gave up on a live client")
 
     def test_a_client_that_goes_away_is_noticed(self):
         t = self.watch()
@@ -122,14 +126,28 @@ class PeerWatchTests(unittest.TestCase):
     def test_the_watcher_stops_when_the_request_is_over(self):
         """It must be finished before the connection is closed.
 
-        A `recv` still blocked on a closed fd wakes on whatever the next
-        thread opens in its place, and would then cancel a stranger's check.
+        A `select` still blocked on a closed fd wakes on whatever the next
+        thread opens in its place, and would then read a stranger's
+        connection.  Since the watcher blocks, the thing that ends it has to
+        be a wake-up and not a flag -- so closing this end is the test.
         """
         t = self.watch()
-        self.done.set()
+        self.stop_w.close()
         t.join(timeout=5)
         self.assertFalse(t.is_alive(), "the watcher outlived its request")
         self.assertFalse(self.gone.is_set(), "a finished request was cancelled")
+
+    def test_a_client_leaving_as_the_request_ends_is_not_reported(self):
+        """Both ready at once, and the request being over wins.
+
+        Whichever order the two land in, there is no check left to cancel and
+        `gone` would be a departure reported against nobody.
+        """
+        t = self.watch()
+        self.them.close()
+        self.stop_w.close()
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive(), "the watcher outlived its request")
 
 
 class ServedRequestTests(unittest.TestCase):

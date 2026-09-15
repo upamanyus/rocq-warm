@@ -255,12 +255,27 @@ The notice is an **EOF on the connection**, not a signal and not a message.
 That covers every way of dying, including the ones that run none of the
 client's own code — and it has to, because the daemon is detached into a
 session of its own, so a terminal's Ctrl+C never reaches it. One watcher
-thread per connection polls for it and sets an event the check reads; it is
-started after the request is read and joined before the connection is closed,
-so nothing is ever left polling an fd that has been handed back to the kernel
-and reissued to somebody else. It never closes the connection itself: the
-request thread still has a reply to attempt on it, and an fd freed early is
-one another thread can be handed before that reply is written.
+thread per connection waits for it and sets an event the check reads.
+
+It *waits*, with no timeout and no poll interval to justify, and that takes a
+second thing to wait on. A thread blocked on the connection alone would still
+be blocked once the request was over, and `close()` does not wake a blocked
+reader: it would sit there until the fd number was reissued to another thread
+and then read somebody else's connection. So each request makes a socketpair
+and the watcher selects on both. Closing the request thread's end is one
+action that ends the watcher and says why, and because the wake-up is
+self-identifying — which fd is ready says whether the client did something or
+the request is simply over — "stop" and "the client spoke" are told apart
+structurally rather than by the order two checks happen to be written in.
+`shutdown(SHUT_RD)` on the connection wakes it just as well and needs no
+second fd, but it arrives looking exactly like a departed client, which is
+the one thing the watcher is there to recognise.
+
+The ordering on the way out is then fixed: close our end of the pair, join the
+watcher, and only then close the fds it was waiting on. The watcher never
+closes the connection itself either — the request thread still has a reply to
+attempt on it, and an fd freed early is one another thread can be handed
+before that reply is written.
 
 The rule is actually broader than the EOF, and deliberately so: **anything
 arriving on the connection ends the request.** The protocol is one request and
@@ -279,7 +294,7 @@ The read is still made, even though both outcomes mean the same thing, because
 it is what makes the readability real. `select` may in principle wake on
 nothing, and cancelling a check whose client is still waiting is the one false
 positive this must not produce; a read that would have blocked is the only way
-back into the poll.
+back into the wait.
 
 What the check does about it is what it already does behind an error: stop
 feeding, and SIGINT the running command once — and only once — the predicate
