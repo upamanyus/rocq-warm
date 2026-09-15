@@ -933,10 +933,19 @@ def _watch_peer(conn, gone, stop):
     client has sent everything it will ever send.  **Anything at all arriving
     on the connection therefore ends the request**: an EOF because the peer is
     gone, and bytes because a client speaking a protocol this daemon does not
-    have is not one to go on working for.  Being strict is the cheap side of
-    that trade now that an abandoned check keeps its session -- a false
-    positive costs the couple of seconds the interrupt takes -- and it rules
-    out two worse shapes.  Dropping the bytes instead would let a second
+    have is not one to go on working for.  Being strict costs the SESSION
+    almost nothing now that an abandoned check keeps it -- a false positive
+    costs the couple of seconds the interrupt takes -- but it is not free to
+    the caller, and that is the part worth stating plainly: a client that is
+    still waiting gets its check abandoned and a reply saying it went away,
+    which it did not.  What makes that acceptable is that no client of this
+    daemon writes anything after its request, so the only way to provoke it
+    is to speak a protocol this one does not have -- which the log below
+    names, so the misleading reply is not the only account of it.  It is also
+    the asymmetry that keeps the read below: guessing from `select` alone
+    would make that same false positive reachable without a client doing
+    anything odd at all.  Strictness rules out two worse shapes, besides.
+    Dropping the bytes instead would let a second
     message on this connection, a pipelined request or an explicit cancel, be
     eaten in silence by the very thread that saw it; and a client that kept
     writing would keep this readable, so a loop that consumed and carried on

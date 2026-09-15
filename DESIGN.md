@@ -281,10 +281,17 @@ The rule is actually broader than the EOF, and deliberately so: **anything
 arriving on the connection ends the request.** The protocol is one request and
 one reply, so a client has already sent everything it will ever send by the
 time the check starts; bytes behind that are a client speaking a protocol this
-daemon does not have, and not one to go on working for. Being strict is the
-cheap side of the trade now that abandoning a check keeps its session — a
-false positive costs the two seconds the interrupt takes — and it rules out
-two worse shapes than itself. Discarding the bytes instead would let a later
+daemon does not have, and not one to go on working for. Being strict costs the
+*session* almost nothing now that abandoning a check keeps it — a false
+positive costs the two seconds the interrupt takes — but it is not free to the
+caller, and the difference is worth being honest about: a client still waiting
+would get its check abandoned and a reply saying it went away, which it did
+not. What makes that acceptable is that no client of this daemon writes
+anything after its request, so provoking it means speaking a protocol this one
+does not have, which the daemon logs by name. It is also the asymmetry that
+keeps the read: trusting `select` alone would put that same false positive
+within reach of a client doing nothing odd at all. Strictness rules out two
+worse shapes besides. Discarding the bytes instead would let a later
 second message on this connection, a pipelined request or an explicit cancel,
 be eaten in silence by the very thread that saw it; and a client that kept
 writing would keep the socket readable, so a watcher that consumed and carried
