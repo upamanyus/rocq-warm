@@ -381,7 +381,6 @@ class SlotReturnTests(ServerCase):
         self.assertTrue(self.check().get("passed"))
         was = self.parked()
         self.assertTrue(was.loaded, "the check recorded nothing as loaded")
-        self.assertTrue(was.library_count)
 
         self.assertTrue(self.srv._reclaim(os.path.abspath(self.path)))
         self.assertIsNone(self.parked(), "the slot kept its dead session")

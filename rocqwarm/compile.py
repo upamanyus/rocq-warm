@@ -1,35 +1,27 @@
 """Compiling a `.vo` on request, without a second build system.
 
-A warm check writes no `.vo`, and it never will by default: a real compile
-costs what the warm check just saved.  But two things ask for one anyway --
-`--compile`, for the file that just checked green, and `--rebuild`, for the
-dependencies a check found stale -- and both run through here so that the
-daemon knows what is in flight.  A check of a dependent that finds a `.vo`
-stale because its compile has not finished yet waits for it rather than
-refusing.
+A warm check writes no `.vo` by default; a real compile costs what the check
+just saved.  `--compile` and `--rebuild` ask for one, and both run through
+here so the daemon knows what is in flight: a check that finds a `.vo` stale
+only because its compile is still running waits for it rather than refusing.
 
-Rules that keep this honest:
+Four rules keep it honest:
 
-* the `.vo` is written where `make` writes it, by the command `make` runs,
-  with the flags from the same `_CoqProject`.  This is the build's own step
-  run on the build's behalf, not an alternative to it;
-* the finished `.vo` is stamped with the time the compile STARTED, not
-  finished.  An edit that lands during the compile then leaves the `.v` newer
-  than the `.vo`, and make -- and `staleness` -- rebuild it.  Stamping it with
-  the finish time would let a `.vo` of the pre-edit text pass as current;
-* `rocq compile` reads the `.v` from disk, so the compiler compiles whatever
-  is on disk when it starts -- which is not always the text that was checked
-  green.  A job carries the digest of the text it was asked to compile, and
-  refuses to run (skips) if the file no longer hashes to it, and discards its
-  output if the file changes while it runs.  Otherwise a green check of text A
-  followed by an edit to B leaves a `.vo` of B that nothing ever checked, or
-  of A that the edit was supposed to supersede -- either way a `.vo` whose
-  contents do not match the check that authorised it;
-* a job whose source changes underneath it is cancelled, and anything a
-  cancelled or failed job wrote is removed.  A truncated `.vo` with a fresh
-  mtime looks exactly like a good one to every mtime rule there is;
-* a job that fails when the check said OK is a rocq-warm bug and is reported
-  as one.
+* the `.vo` goes where `make` puts it, written by the command `make` runs,
+  with the flags from the same `_CoqProject`.  The build's own step, not an
+  alternative to it;
+* it is stamped with the time the compile STARTED.  An edit landing during
+  the compile then leaves the `.v` newer, so make and `staleness` rebuild it;
+  a finish-time stamp would let a `.vo` of the pre-edit text pass as current;
+* `rocq compile` reads the `.v` from disk, which need not still hold the text
+  that was checked green.  A job carries that text's digest, skips if the file
+  no longer hashes to it, and discards its output if the file changes while it
+  runs.  Otherwise the `.vo` does not match the check that authorised it;
+* anything a cancelled or failed job wrote is removed, since a truncated `.vo`
+  with a fresh mtime is indistinguishable from a good one.
+
+A job that fails after a green check is a rocq-warm bug, and is reported as
+one.
 """
 
 import hashlib
@@ -107,7 +99,6 @@ class Job:
         return {"path": self.v, "state": self.state, "why": self.why,
                 "seconds": ((self.finished or time.time()) - self.started
                             if self.started else 0.0),
-                "queued": time.time() - self.submitted,
                 "rc": self.rc}
 
 
@@ -128,19 +119,15 @@ class Compiler:
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
 
-    @property
-    def enabled(self):
-        return self.max_jobs > 0 and not self._closed
-
     # ------------------------------------------------------------- submit
 
     def submit(self, v, flags, cwd, rocq="rocq", env=None, digest=None,
                after=()):
         """Queue a compile of `v`; returns the Job.
 
-        A queued or running job for the same text and flags is reused.  One
-        for a different text is cancelled: its `.vo` would describe a file
-        that no longer exists.
+        A queued or running job for the same text and flags is reused; one for
+        a different text is cancelled, its `.vo` being about a file that no
+        longer exists.
         """
         v = os.path.abspath(v)
         if digest is None:
@@ -277,10 +264,9 @@ class Compiler:
         return False
 
     def _run(self, job):
-        # rocq compile reads the file from disk.  If it no longer holds the
-        # text this job was asked to compile, compiling it would write a .vo
-        # of some other text under this job's name; a newer job covers the
-        # newer text, so this one steps aside.
+        # `rocq compile` reads from disk, so if the file no longer holds this
+        # job's text the .vo would be of some other text under this job's
+        # name.  A newer job covers the newer text; this one steps aside.
         if digest_of(job.v) != job.digest:
             with self.cv:
                 job.state = "skipped"
@@ -321,9 +307,8 @@ class Compiler:
             if job.state == "cancelled":
                 self._remove_outputs(job)
             elif digest_of(job.v) != job.digest:
-                # The file changed WHILE rocq was reading or compiling it, so
-                # what landed in the .vo is neither reliably the old text nor
-                # reliably the new one.  Throw it away; the newer job is the
+                # Changed WHILE rocq was reading it, so the .vo is reliably
+                # neither the old text nor the new.  The newer job is the
                 # source of truth.
                 self._remove_outputs(job)
                 job.state = "skipped"
@@ -346,8 +331,8 @@ class Compiler:
 
     @staticmethod
     def _remove_outputs(job):
-        """Drop whatever this job wrote: a partial `.vo` with a fresh mtime is
-        indistinguishable from a good one to every rule that reads mtimes."""
+        """Drop whatever this job wrote: a partial `.vo` with a fresh mtime
+        passes every mtime rule as a good one."""
         for path in outputs_of(job.v):
             try:
                 if os.stat(path).st_mtime_ns >= job.started_ns:

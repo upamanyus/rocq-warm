@@ -1,16 +1,12 @@
-"""How a check reads: what the client prints, and what it exits with.
+"""What a check prints, and what it exits with.
 
-This lives on the daemon's side of the socket, and the reason is not tidiness.
-The daemon has the bytes it checked, the workspace root and the compile job;
-the client has a path and a socket.  Every question answered here -- where a
-diagnostic is, whether the `.vo` got written, whether this is a 0, a 1, a 2 or
-a 3 -- was previously answered in the client from strictly less evidence, and
-answering it in both places is how two copies of one policy drift apart.
+On the daemon's side of the socket, where the evidence is: the bytes checked,
+the workspace root, and the compile job.  The client writes these two strings
+and exits with this code.
 
-The exit code is the load-bearing part.  `rocq-warm` promises that 1 means the
-proof is wrong and 2 means the proof was never checked, and a caller -- a
-person's `make`, or an agent's retry loop -- acts on the difference.  It is
-decided once, here, next to the evidence for it.
+Exit codes: 0 the file checks, 1 it does not, 2 it was never checked, 3 a green
+verdict that a real `rocq compile` rejected.  Callers act on the difference
+between 1 and 2, so it is decided once, here.
 """
 
 import os
@@ -60,8 +56,8 @@ def _verdict(resp, display, root, req):
         return out, log, 0
     out += vo["output"] if vo else ""
     if vo is not None and vo["state"] == "failed":
-        # The one thing that must never happen: we said yes and a real
-        # compile said no.
+        # Green here and rejected by a real compile: the one disagreement
+        # that must never happen.
         log += ("rocq-warm: rocq compile DISAGREED (exit %s) -- this is a bug "
                 "in rocq-warm, please report it\n" % vo["rc"])
         return out, log, 3
@@ -71,11 +67,8 @@ def _verdict(resp, display, root, req):
 
 
 def _refusal(resp, display, root):
-    """A check that did not happen, and exactly why.
-
-    Exit 2, never 1.  None of these is a verdict about the proof, and reading
-    one as a proof failure is the mistake the exit codes exist to prevent.
-    """
+    """A check that did not happen, and why.  Exit 2, never 1: none of these
+    is a verdict about the proof."""
     busy = resp.get("busy")
     if busy:
         secs = busy.get("seconds")
@@ -120,8 +113,8 @@ def status(resp):
               "; machine has %.1f GB free, yields below %.1f"
               % (avail / 1e9, resp.get("min_free", 0) / 1e9)))
     for s in resp["sessions"]:
-        # "idle 4s" about a session being checked right now reads as the
-        # opposite of the truth, so a busy one says so, and for how long.
+        # "idle 4s" would read as the opposite of the truth for a session
+        # being checked, so a busy one says so instead.
         when = ("busy %4.0fs" % s["busy_for"] if s["busy"]
                 else "idle %4.0fs" % s["idle"])
         out += ("  %-60s %s %4d sentences  %5.1f GB  %s  %4d .vo watched  "

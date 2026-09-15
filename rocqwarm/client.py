@@ -1,25 +1,18 @@
 """`rocq-warm` -- the CLI in front of the warm-session daemon.
 
-Deliberately thin.  It does four things the daemon cannot do for itself, and
-then gets out of the way:
+Four things the daemon cannot do for itself: find the workspace its daemon
+serves, resolve which `rocq` this shell means and the environment that
+resolved it, start the daemon if nobody is serving that tree, then write the
+reply to stdout and stderr and exit with the code it carries.
 
-* find the workspace the daemon for this file lives in;
-* resolve which `rocq` this shell means, and the environment that resolved it
-  -- the whole point, since a daemon outlives the shell that started it and
-  the next caller may be in another opam switch;
-* start the daemon if nobody is serving that tree yet;
-* write what comes back to stdout and stderr, and exit with the code it says.
+Resolving the toolchain is the part only the client can do, since a daemon
+outlives the shell that started it and the next caller may be in another opam
+switch.  How a check reads -- diagnostics in `coqc`'s format, the warnings,
+the verdict line, the exit code -- is the daemon's, in `report`.
 
-Everything about how a check READS is the daemon's: diagnostics in `coqc`'s
-exact format so `grep Error` keeps working, the warnings, the verdict line,
-and which of the exit codes it is.  That side has the bytes it checked, the
-workspace root and the compile job, and deciding any of it in both places is
-how the two copies drift.
-
-Exit codes: 0 the file checks, 1 it does not, 2 it could not be checked at
-all -- a dependency whose `.vo` is older than its source, the file is already
-being checked, no daemon, no rocq -- and 3 for the one thing that must never
-happen, a green verdict that a real `rocq compile` then rejects.
+Exit codes: 0 the file checks, 1 it does not, 2 it could not be checked (a
+stale dependency, the file is already being checked, no daemon, no rocq), 3 a
+green verdict that a real `rocq compile` then rejects.
 """
 
 import argparse
@@ -34,10 +27,9 @@ import time
 from . import project, server
 
 
-# The environment variables that decide WHICH Rocq runs and where it looks for
-# libraries.  The daemon spawns its sessions with exactly these, taken from the
-# client, so a warm session behaves like the shell you invoked from -- not like
-# the shell that happened to start the daemon an hour ago.
+# The variables that decide WHICH Rocq runs and where it finds libraries.  The
+# daemon spawns its sessions with exactly these, taken from the client, so a
+# session behaves like the shell that invoked it.
 ROCQ_ENV = ("PATH", "OCAMLPATH", "CAML_LD_LIBRARY_PATH", "OCAMLLIB",
             "COQPATH", "ROCQPATH", "COQLIB", "ROCQLIB", "COQCORELIB")
 
@@ -51,9 +43,9 @@ def rocq_environment():
 def workspace_for(path):
     """Where the daemon for `path` lives.
 
-    The git checkout, when there is one, so that `status` and `stop` find the
-    same daemon from anywhere in the tree -- a project can have several
-    `_CoqProject` files and one daemon serves them all.
+    The git checkout when there is one, so `status` and `stop` find the same
+    daemon from anywhere in the tree: a project may hold several `_CoqProject`
+    files, and one daemon serves them all.
     """
     start = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
     try:
@@ -91,11 +83,10 @@ def connect(root, spawn=True, timeout=30.0):
 
 
 def spawn_daemon(root):
-    """Start the daemon, detached, with an explicit path to our own package.
+    """Start the daemon detached, with an explicit path to our own package.
 
-    Not by cwd: `python -m` finding the package because of where it happens to
-    be run from is exactly the kind of thing that breaks when someone moves the
-    checkout or symlinks the entry point.
+    Not by cwd: `python -m` resolving the package from wherever it happens to
+    run breaks when the checkout moves or the entry point is symlinked.
     """
     os.makedirs(os.path.join(root, ".rocq-warm"), exist_ok=True)
     package_parent = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -122,14 +113,7 @@ def request(root, msg, spawn=True):
 
 
 def cmd_check(args):
-    """Ask the daemon, print what it says, exit with the code it gives.
-
-    Everything about how a check READS -- the diagnostics in `coqc`'s shape,
-    the warnings, the verdict line, and which of 0/1/2/3 it is -- is decided
-    by the daemon, which is the side that has the text it checked, the
-    workspace root and the compile job.  Deciding any of it twice is how the
-    two copies drift.
-    """
+    """Ask the daemon, print what it says, exit with the code it gives."""
     path = os.path.abspath(args.file)
     if not os.path.isfile(path):
         raise SystemExit("rocq-warm: no such file: %s" % path)
@@ -148,9 +132,8 @@ def cmd_check(args):
         print(json.dumps(resp, indent=2))
     else:
         sys.stdout.write(resp.get("out", ""))
-    # The fallbacks are for a daemon that failed before it could render --
-    # an unhandled exception in `handle`, which answers with an error and
-    # nothing else.
+    # The fallbacks cover a daemon that failed before it could render, and so
+    # answered with an error and nothing else.
     sys.stderr.write(resp.get("log")
                      or "rocq-warm: %s\n" % resp.get("error", "no response"))
     return resp.get("exit", 2)

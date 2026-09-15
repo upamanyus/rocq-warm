@@ -1,42 +1,23 @@
-"""The rocq-warm supervisor: warm sessions, kept alive between `rocq-warm` runs.
+"""The rocq-warm supervisor: warm `rocq repl` sessions, one per `.v` file.
 
-One process per workspace, listening on a Unix socket under
-`<workspace>/.rocq-warm/`.  It owns the `rocq repl` children, so a check from a
-fresh shell reuses the session the previous check left parked at the edit.
+One process per workspace, on a Unix socket under `<workspace>/.rocq-warm/`.
+It owns the `rocq repl` children, so a check from a fresh shell reuses the
+session the previous check left parked at the edit.
 
-Every guard here exists because a warm session that lies is worse than no
-session at all:
+A session must never answer for a library that no longer exists, so: it is
+discarded when any `.vo` it loaded changes on disk (the watched set being what
+Rocq reports loading, not a `rocq dep` guess); a check is refused rather than
+answered when any `.vo` in the closure is one make would rebuild, unless this
+daemon's own compile of it is still running, in which case that is waited for;
+and a green check, which writes no `.vo`, says so.  Sessions over their RSS
+ceiling and checks over their wall timeout are killed and reported; sessions
+are evicted LRU under a memory budget, and idle ones time out.
 
-* a rebuilt dependency `.vo` throws the session away rather than being checked
-  against the copy Rocq loaded into memory an hour ago -- and the set of
-  `.vo` files watched is the one Rocq itself reports having loaded, not a
-  guess from `rocq dep`;
-* a dependency whose `.vo` is older than its `.v` (or than a `.vo` it
-  requires) is refused, not checked against: the verdict would be about a
-  library that no longer exists.  Make's own rule decides what "older" means;
-* a green check does NOT write a `.vo` -- that would double the cost of
-  every passing check -- so it says so, and a dependent checked next is
-  refused until the `.vo` is rebuilt (by `make`, by `--compile`, or by
-  `--rebuild`).  A compile the daemon is running itself is waited for;
-* a session that exceeds its RSS ceiling or a check that exceeds its wall
-  timeout is killed and reported, not left resident -- a large development has a history
-  of a single `vm_compute` reaching 31 GB;
-* sessions are evicted LRU under a global memory budget, and idle ones time out.
-
-**At most one `rocq repl` per file, and at most one check of it at a time.**
-`self.sessions` maps each file to a `Slot`, which either holds that file's
-session or records that a check has BORROWED it.  A borrower gets the session
-that exists or starts the one that does not; a second check of the same file
-finds the slot borrowed and is REFUSED rather than queued.  So a session needs
-no lock of its own -- a borrowed one has exactly one user -- and nothing in
-here ever waits on another thread, which leaves no lock ordering to establish
-and no hang to reason about.
-
-Refusing rather than waiting, because waiting buys nothing: two `rocq repl`
-for one file is twice several GB spent answering one question, and the loser
-would pay a second full cold start, where run one after the other the second
-replays warm in no measurable time.  The caller that loses is told the file is
-busy and for how long, and its retry is that instant replay.
+`self.sessions` maps each file to a `Slot` holding the file's session or marked
+borrowed by a running check, giving at most one `rocq repl` per file and one
+check of it at a time.  A borrower takes the session that exists or starts the
+one that does not; a second check of the same file is refused rather than
+queued.  So a session needs no lock, and nothing here waits on another thread.
 """
 
 import fcntl
@@ -57,12 +38,11 @@ DEFAULT_MAX_SESSIONS = 4
 DEFAULT_CHECK_TIMEOUT = 1800.0
 
 
-# A daemon is per-checkout, and build machines run many checkouts at once.
-# Every one of these defaults is therefore about NOT assuming the machine is
-# ours: a daemon that helps itself to half of RAM is fine alone and ruinous
-# ten-up, and the process it gets killed to make room for is somebody else's.
+# Absolute caps rather than a share of RAM: a per-checkout daemon that takes
+# half of memory is fine alone and ruinous ten-up, and the process the kernel
+# kills to make room belongs to somebody else.
 DEFAULT_BUDGET_CAP = 32e9       # this daemon's sessions, all together
-DEFAULT_MIN_FREE = 4e9          # ... and leave at least this much for others
+DEFAULT_MIN_FREE = 4e9          # ... and left free for everyone else
 
 
 def _total_bytes():
@@ -73,11 +53,8 @@ def _total_bytes():
 
 
 def _available_bytes():
-    """What the kernel thinks can still be allocated without swapping.
-
-    The number that matters on a shared machine: it moves when OTHER people's
-    work grows, which per-daemon bookkeeping cannot see.
-    """
+    """Allocatable memory, which unlike our own bookkeeping moves when other
+    processes on this machine grow."""
     try:
         with open("/proc/meminfo") as f:
             for line in f:
@@ -110,26 +87,21 @@ def _session_ceiling(budget, max_sessions):
     if env:
         return float(env) * 1e9
     # Half the budget, not budget/max_sessions: one big proof legitimately
-    # costs several GB, and a ceiling tight enough to kill it is worse than no
-    # ceiling at all.  This still catches a runaway an order of magnitude out.
+    # costs several GB, and a ceiling that kills it is worse than none.
     return budget / 2.0
 
 
 class Slot:
-    """What the daemon knows about one `.v` file, across sessions.
+    """One `.v` file's entry in the session table.
 
-    A slot either holds the file's parked `Session` or records that somebody
-    has BORROWED it, and that is how there comes to be **at most one `rocq
-    repl` per file**: a borrower gets the session that exists or starts the
-    one that does not, and a second check arriving meanwhile finds `borrowed`
-    and is refused rather than starting a second.  Only the borrower may
-    start, stop or replace `sess`; everyone else may look at it and no more.
+    Holds that file's `Session`, or is marked `borrowed` by the check using
+    it.  Only the borrower may start, stop or replace `sess`; a non-borrower
+    may read it and no more, `_stop_all` excepted.
 
-    What lives here is what outlives any single session -- when the file was
-    last checked, and who has it now.  What describes a particular `rocq
-    repl` -- the flags and switch it was spawned for, the libraries it has
-    loaded -- lives on the `Session`, so that throwing the process away
-    throws that away with it rather than leaving it to be cleared by hand.
+    The fields here outlive any single session: when the file was last
+    checked, and who holds it now.  What describes one `rocq repl` -- its
+    flags, toolchain and loaded `.vo` set -- lives on the `Session`, so
+    discarding the process discards that with it.
     """
 
     def __init__(self, path):
@@ -141,21 +113,17 @@ class Slot:
         self.deadline = None        # ... and what it promised to finish by
 
     def ready(self, flags, cwd, toolchain, rocq, env, rss_limit, cold):
-        """The session to check with: started, and answering for THIS build.
+        """The session to check with, started and answering for THIS build.
 
-        Every reason to throw a session away lands here, in the borrower's
-        hands, where it is a field assignment rather than a table mutation.
-        That is the whole trick: `flags` and the toolchain are fixed when a
-        `Session` is constructed, so while that construction happened under
-        the session table's lock, changing either had to be spelled as a
-        replacement in the table -- and the table was the only thing holding
-        the child.
+        Discards and respawns when the flags or toolchain differ from the ones
+        the session was spawned for, when a `.vo` it loaded has changed, or on
+        `--cold`.  The caller owns the slot, so each of those is a field
+        assignment rather than a table mutation.
         """
         if self.sess is not None and not self.sess.alive:
             self.discard()          # a dead child holds nothing worth keeping
-        # Guarded on there BEING a session: with none there is nothing to
-        # invalidate, and `loaded_changed()` would stat every .vo that a
-        # session which no longer exists used to hold.
+        # Only when there IS a session: otherwise `loaded_changed()` would
+        # stat the `.vo` set of a session that no longer exists.
         if self.sess is not None:
             if (flags, toolchain) != (self.sess.flags, self.sess.toolchain):
                 self.discard()
@@ -169,7 +137,7 @@ class Slot:
         return self.sess
 
     def discard(self):
-        """Stop the child.  What described it goes with it."""
+        """Stop the child; its flags and loaded set go with it."""
         if self.sess is not None:
             self.sess.stop()
             self.sess = None
@@ -182,11 +150,9 @@ class Server:
         self.dir = os.path.join(self.root, ".rocq-warm")
         self.sock_path = os.path.join(self.dir, "sock")
         self.pids_path = os.path.join(self.dir, "sessions")
-        # path -> Slot, one per file the daemon has been asked about.  A slot
-        # is never removed, so every `rocq repl` that exists is reachable from
-        # here at every instant: there is no move for a child to be lost in.
-        # A slot is a few hundred bytes; the session inside it is the gigabytes
-        # and the only thing reclamation takes away.
+        # path -> Slot, one per file checked, never removed: every live `rocq
+        # repl` is reachable from here at all times.  A slot is a few hundred
+        # bytes; the session in it is the gigabytes reclamation takes away.
         self.sessions = {}
         self.lock = threading.Lock()
         self.idle_timeout = idle_timeout
@@ -205,9 +171,8 @@ class Server:
     @staticmethod
     def _toolchain_env(toolchain):
         rocq, env_items = (toolchain or (None, ()))
-        # MERGE, never replace: subprocess `env=` is the child's whole
-        # environment, and a child without HOME or TMPDIR misbehaves in
-        # ways that have nothing to do with Rocq.
+        # MERGE, never replace: `env=` is the child's whole environment, and
+        # one without HOME or TMPDIR misbehaves for non-Rocq reasons.
         env = dict(os.environ, **dict(env_items)) if env_items else None
         return rocq or "rocq", env
 
@@ -227,16 +192,11 @@ class Server:
     def _borrow(self, path, deadline=None):
         """The slot for `path`, the caller's alone until `_give_back`.
 
-        None if somebody else has it: one check per file at a time, and the
-        caller that loses is refused rather than queued.  A session needs no
-        lock of its own, because a borrowed one has exactly one user.
-
-        Making the slot and refusing it are safe in this order only because a
-        slot is born unborrowed, so the one below can never fire for the one
-        above.  What the `borrowed` test must not do is fall through and let
-        the caller spawn: two threads checking one file, both finding nothing
-        parked, both starting a `rocq repl`, is exactly the bug this replaces,
-        and it is one missing `return` away.
+        None if another check holds it: one check per file, refused rather than
+        queued, so a borrowed session has one user and needs no lock.  A new
+        slot is born unborrowed, so creating one cannot trip the refusal below
+        it; that refusal must return rather than fall through, or two threads
+        that both found nothing parked would both spawn a `rocq repl`.
         """
         path = os.path.abspath(path)
         with self.lock:
@@ -259,10 +219,9 @@ class Server:
     def _live_sessions(self):
         """(slot, session) for every slot that has one.
 
-        `slot.sess` is read ONCE per slot.  A borrower may be discarding it,
-        and the point of reading it into a local is that a test and a use
-        cannot then disagree -- which is all a non-borrower is allowed to do
-        with it anyway: look, never change.
+        `slot.sess` is read once per slot, so that a borrower discarding it
+        cannot make a test and a use of it disagree.  Reading is all a
+        non-borrower may do.
         """
         with self.lock:
             slots = list(self.sessions.values())
@@ -278,17 +237,11 @@ class Server:
     def _record_sessions(self):
         """Write down which `rocq` processes we own.
 
-        `Session.stop` only runs if the daemon is alive to run it.  Kill the
-        daemon itself -- `kill -9`, a lost terminal, an OOM -- and its children
-        are left blocked on a closed stdin, holding several GB each, with
-        nothing that will ever reap them.  A pid file lets the NEXT daemon
-        clean up after the last one.
-
-        Call this wherever a pid appears or goes away, which means after a
-        session STARTS and not merely when a slot is created.  Recording at
-        creation writes down an empty row -- the session starts afterwards --
-        so a daemon holding one session used to record nothing at all, and the
-        reaper had nothing to collect.
+        `Session.stop` only runs if the daemon is alive to run it, so a
+        `kill -9` leaves children blocked on a closed stdin holding several GB
+        each, and this file is how the next daemon collects them.  Called
+        wherever a pid appears or goes, which is after a session starts rather
+        than when its slot is created: a slot has no pid yet.
         """
         try:
             rows = ["%d\t%s" % (pid, slot.path)
@@ -335,19 +288,14 @@ class Server:
     def _evict(self):
         """Keep the session set inside our own budget AND the machine's.
 
-        Our own budget bounds one daemon.  It cannot bound ten, and it cannot
-        see the compile somebody else just started, so eviction also yields
-        when the machine as a whole is running out -- which is the only signal
-        that works when the pressure is not ours.  Under real pressure we will
-        give up our last session too: degrading to a cold check is a cost we
-        pay ourselves, where an OOM kill is a cost somebody else pays.
-
-        A borrowed session is never a candidate -- killing the child out from
-        under a running check throws away exactly the work being saved -- but
-        it still COUNTS, or we would admit a session against memory that is
-        already spoken for.  So does a slot that is borrowed and has no session
-        yet: that is a cold start in progress, and it is the reason `do_check`
-        calls this BEFORE spawning rather than after.
+        Our budget bounds one daemon and cannot bound ten, so eviction also
+        yields when `MemAvailable` is low, the only signal that moves when the
+        pressure is not ours; under it even the last session goes, a cold check
+        being a cost we pay ourselves where an OOM kill is one somebody else
+        pays.  A borrowed session is never a candidate, since killing the child
+        under a running check discards the work being saved, but it still
+        counts against the budget -- as does a borrowed slot with no session
+        yet, a cold start in progress.
         """
         while True:
             live = self._live_sessions()
@@ -371,13 +319,12 @@ class Server:
                 continue                # somebody took it; try the next
 
     def _reclaim(self, path):
-        """Stop `path`'s session, if nobody is using it.
+        """Stop `path`'s session, if no check holds it.
 
-        Borrow the victim like any other caller.  That is not ceremony:
-        `discard()` waits on the child, so it cannot run under `self.lock`,
-        and the borrow is what stops a check from starting on this file while
-        we are in the middle of killing its Rocq.  False if somebody else has
-        it, which is the whole of "do not evict a session mid-check".
+        Borrows the victim first: `discard()` waits on the child so it cannot
+        run under `self.lock`, and the borrow keeps a check from starting on
+        the file while its Rocq is being killed.  False if another caller
+        holds it.
         """
         slot = self._borrow(path)
         if slot is None:
@@ -398,17 +345,11 @@ class Server:
             self._reclaim(path)
 
     def report_wedged(self):
-        """Say so when a slot has been checked out past its own deadline.
+        """Log any slot still borrowed well past its check's deadline.
 
-        Every check carries a wall timeout, so no slot can legitimately still
-        be held long after it: one that is means the check machinery itself is
-        stuck, and its file has been refusing checks ever since.  That is the
-        one failure this ownership model can produce, and it is silent unless
-        somebody says it out loud.
-
-        It deliberately does NOT reclaim the slot.  The thread that owns it may
-        still be running, and taking a session away from a thread that is using
-        it is exactly the class of bug the model removes.
+        Every check carries a wall timeout, so a slot held long after it means
+        the machinery is stuck and the file has been refusing checks since.
+        Not reclaimed: the borrower may still be running.
         """
         now = time.time()
         with self.lock:
@@ -441,15 +382,12 @@ class Server:
         return {"ok": False, "error": "unknown command %r" % cmd}
 
     def do_check(self, req):
-        """Check a file, and say exactly what to print and what to exit with.
+        """Check a file; the reply carries what to print and what to exit with.
 
-        The rendering is in `report`, on this side of the socket.  The daemon
-        has the bytes it checked, the workspace root and the compile job; a
-        client that re-derives any of that is a second implementation of the
-        same policy -- and the exit code IS policy, since "could not be
-        checked" (2) and "the proof is wrong" (1) are the distinction the
-        whole tool turns on.  So `rocq-warm check` writes two strings and
-        exits.
+        Rendering is in `report`, on this side of the socket, where the checked
+        text, the workspace root and the compile job are.  The exit code is
+        policy -- 1 "the proof is wrong" against 2 "never checked" -- so it is
+        decided once, here.
         """
         path = os.path.abspath(req["path"])
         resp = self._check(path, req)
@@ -464,8 +402,6 @@ class Server:
             return {"ok": False, "error": str(e)}
         t0 = time.time()
         timeout = float(req.get("timeout") or DEFAULT_CHECK_TIMEOUT)
-        # `Set Silent` is decided when the session starts, so asking for the
-        # proof's own output means starting over.
         toolchain = (req.get("rocq"),
                      tuple(sorted((req.get("env") or {}).items())))
         rocq, env = self._toolchain_env(toolchain)
@@ -499,22 +435,17 @@ class Server:
                     "error": "%d stale dependenc%s" % (
                         len(stale), "y" if len(stale) == 1 else "ies")}
 
-        # One check per file at a time.  A second one is refused outright
-        # rather than queued: what it would be waiting on is a proof, so no
-        # deadline is honest, and once the running check finishes the same
-        # question is answered by a warm replay that executes nothing.
+        # One check per file at a time.  Refused rather than queued: what a
+        # waiter would wait on is a proof, so no deadline would be honest.
         slot = self._borrow(path, deadline=t0 + timeout)
         if slot is None:
             return self._busy_refusal(path)
         try:
-            # Make room BEFORE spawning, not after: this slot is borrowed, so
-            # it cannot be chosen as a victim (right -- it is in use) while its
-            # session still counts against the budget (right -- we are about
-            # to fill it).
+            # Before spawning: this slot is borrowed so eviction cannot pick
+            # it, and the session it will hold already counts.
             self._evict()
-            # Everything we know the session holds or is about to load, stat'ed
-            # BEFORE it loads anything.  A .vo rebuilt while the check runs must
-            # not be recorded with its new mtime as if that were what was loaded.
+            # Stat'ed before the session loads anything: a `.vo` rebuilt mid
+            # check must not be recorded as though that were what it loaded.
             parked = slot.sess
             watched = sorted(set(closure)
                              | set(parked.loaded if parked else ()))
@@ -559,15 +490,12 @@ class Server:
                 slot.discard()
             else:
                 sess.loaded = {p: pre.get(p, post[p]) for p in post}
-                sess.library_count = len(libraries)
         finally:
-            # Unmissable: a slot never given back leaves its file refused for
-            # the daemon's life.
+            # A slot never given back refuses its file for the daemon's life.
             self._give_back(slot)
             self._record_sessions()
-        # The file is checkable again from here.  A `--compile` is a real
-        # `rocq compile` that can run for minutes and does not touch the
-        # session, so it must not be inside the checkout.
+        # Checkable again from here: `--compile` runs a real `rocq compile`
+        # for minutes and touches no session, so it is outside the borrow.
         compile_mod.log("check: %s %s [%s, %d sentences, %.1fs]%s", path,
                         "OK" if result.ok else "FAILED", result.mode,
                         result.replayed, result.seconds,
@@ -588,42 +516,35 @@ class Server:
             "sentences": result.total,
             "seconds": result.seconds,
             "rss": rss,
-            "libraries": len(libraries),
             "stale": stale_rows,            # only when allow_stale let it through
             "note": note,
             "vo": _describe_job(job) if job is not None else None,
-            # Why make would rebuild THIS file's .vo now -- after a green
-            # check that is "its source is newer", which the user is told.
+            # Why make would rebuild THIS file's .vo now; after a green check
+            # that is "its source is newer".
             "vo_stale": project.staleness(project.vo_of(path), graph.graph),
-            # The digest of the bytes this verdict is about, so a caller that
-            # edits fast can tell whether it is about what it wrote.
+            # The bytes this verdict is about, for a caller that edits fast.
             "digest": digest,
-            # Resolved HERE, against the text we actually checked.  The client
-            # used to re-read the .v to turn these offsets into a line, with
-            # nothing tying the two reads together.
+            # Resolved against the text checked, so nothing re-reads the file.
             "diags": [{"kind": d.kind,
-                       "span": d.span(text),
                        "at": diag.line_col(text, d.span(text)),
                        "message": d.message().decode("utf8", "replace")}
                       for d in result.diags],
         }
 
     def _busy_refusal(self, path):
-        """A check that did not happen because the file is being checked.
+        """A check refused because another one holds the file.
 
-        Exit 2 at the client, alongside a stale dependency: not a verdict about
-        the proof.  It carries how long the file has been busy, which is what
-        makes a session wedged by a hung check diagnosable rather than a
-        mystery -- a file that has been busy for three days says so.
+        Exit 2 at the client, like a stale dependency: not a verdict about the
+        proof.  Carries how long the file has been busy, which is what makes a
+        wedged slot diagnosable.
         """
         with self.lock:
             slot = self.sessions.get(path)
             since = slot.since if slot is not None and slot.borrowed else None
         row = {"path": path, "since": since,
                "seconds": None if since is None else time.time() - since}
-        # The elapsed time is the part that can be missing -- the slot may have
-        # been given back between the failed checkout and this lookup -- so the
-        # reason is phrased the same either way, and only the detail varies.
+        # Can be missing: the slot may have been given back since the borrow
+        # failed.
         detail = ("" if row["seconds"] is None
                   else ", running for %.0fs" % row["seconds"])
         return {"ok": False, "busy": row,
@@ -635,10 +556,9 @@ class Server:
     def _stale(self, closure, graph, deadline):
         """Stale members of `closure`, after waiting for our own compiles.
 
-        A `.vo` that is stale because its compile has not finished yet is
-        not a reason to refuse; it is a reason to wait.  Only the daemon's
-        own jobs are waited for -- somebody's `make` in another terminal is
-        invisible, and guessing at it would be guessing.
+        A `.vo` still stale because its compile has not finished is a reason
+        to wait, not to refuse.  Only this daemon's own jobs are waited for; a
+        `make` in another terminal is invisible to us.
         """
         while True:
             stale = project.stale_deps(closure, graph.graph)
@@ -690,13 +610,10 @@ class Server:
             self.compiler.cancel(path)
 
     def do_status(self):
-        """What the daemon is holding, including what is being checked now.
+        """What the daemon holds, sessions being checked right now included.
 
-        This reads sessions it does not own, which is allowed because it only
-        OBSERVES: a pid, an RSS, and the length of a list the owner may be
-        appending to.  Each is a single read that cannot raise, and the worst
-        it can report is a number from the middle of a running check -- which
-        is the number `status` is being asked for.
+        Reads sessions it does not own, which is safe because it only observes
+        -- a pid, an RSS, a list's length -- in single reads that cannot raise.
         """
         now = time.time()
         out = []
@@ -706,17 +623,14 @@ class Server:
             out.append({
                 "path": slot.path,
                 "pid": sess.live_pid(),
-                "alive": sess.live_pid() is not None,
                 "sentences": len(sess.sentences),
                 "complete": sess.complete,
                 "rss": sess.rss_bytes(),
-                # `idle` is time since it was last GIVEN BACK, which for a
-                # session being checked right now is not idleness at all --
-                # hence `busy`, and how long it has been that way.
+                # Time since the slot was given back, which is not idleness
+                # for a session being checked -- hence `busy`.
                 "idle": now - slot.last_used,
                 "busy": slot.borrowed,
                 "busy_for": None if since is None else now - since,
-                "libraries": sess.library_count,
                 "watched": len(sess.loaded),
             })
         resp = {"ok": True, "pid": os.getpid(),
@@ -732,11 +646,10 @@ class Server:
     def serve(self):
         """Serve this workspace, if nobody else already is.
 
-        Two clients can race to spawn a daemon.  Without the lock the loser
-        unlinks the winner's socket and binds its own, which orphans a daemon
-        that keeps its sessions resident and unreachable until it times out --
-        exactly the memory nobody can account for.  The lock fd is held for the
-        daemon's life and released when it exits.
+        Two clients can race to spawn one.  Without the lock the loser unlinks
+        the winner's socket and binds its own, orphaning a daemon that holds
+        its sessions resident and unreachable until it times out.  The lock fd
+        is held for the daemon's life.
         """
         os.makedirs(self.dir, exist_ok=True)
         self._lock_fd = os.open(os.path.join(self.dir, "lock"),
@@ -787,17 +700,13 @@ class Server:
                 pass
 
     def _stop_all(self):
-        """Stop every child, owned or not.  Never leave one behind.
+        """Stop every child, borrowed or not.  Never leave one behind.
 
-        The single place a non-borrower changes a borrowed slot, and it is
-        deliberate: the daemon is on its way out, a mid-check child has to die
-        anyway, and a shutdown that waits for a thirty-minute check to give
-        its slot back is exactly the hang a shutdown path must not have.  It
-        reaches everything, because a slot never leaves the table.
-
-        A borrower whose child dies under it sees `SessionDead`, discards a
-        session that is already gone, and gives the slot back -- the same path
-        it takes for a Rocq that died on its own.
+        The one place a non-borrower changes a borrowed slot: the daemon is on
+        its way out, a mid-check child has to die anyway, and waiting for a
+        long check to give its slot back would hang.  Reaches everything, since
+        a slot never leaves the table; a borrower whose child dies under it
+        sees `SessionDead` and takes its usual discard path.
         """
         for slot, _sess in self._live_sessions():
             try:

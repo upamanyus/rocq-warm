@@ -265,17 +265,30 @@ Qed.
         again = self.check()
         self.assertIn(b"cold", again.stderr)
 
-    def test_concurrent_checks_of_one_file_do_not_interleave(self):
-        """Two clients, one session: the second must wait, not corrupt the
-        first's stream."""
+    def test_racing_checks_of_one_file_never_share_a_session(self):
+        """One session per file, so one check of it at a time.
+
+        Four clients on a warm file need not overlap at all, since a replay is
+        instant, so this does not assert that any of them collides.  What it
+        asserts is that a client which does collide is refused at exit 2
+        rather than handed a second session, and that the winner's stream is
+        left intact.
+        """
         self.assertEqual(self.check().returncode, 0)
         procs = [subprocess.Popen([CLI, "check", self.NAME],
                                   cwd=self.ws.dir, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE)
                  for _ in range(4)]
+        codes = []
         for p in procs:
-            out, err = p.communicate(timeout=300)
-            self.assertEqual(p.returncode, 0, err)
+            _out, err = p.communicate(timeout=300)
+            codes.append(p.returncode)
+            if p.returncode == 2:
+                self.assertIn(b"already being checked", err)
+            else:
+                self.assertEqual(p.returncode, 0, err)
+        self.assertIn(0, codes, codes)
+        self.assertEqual(self.check().returncode, 0, "the stream was disturbed")
 
     def test_killing_the_daemon_takes_its_idle_sessions_with_it(self):
         """Not because anything reaps them: the daemon holds the only writer on
@@ -415,9 +428,17 @@ class ConcurrentAgentTests(unittest.TestCase):
         procs = [subprocess.Popen([CLI, "check", "P.v"], cwd=self.a.dir,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                  for _ in range(8)]
+        codes = []
         for p in procs:
             _out, err = p.communicate(timeout=300)
-            self.assertEqual(p.returncode, 0, err)
+            codes.append(p.returncode)
+            # One check per file, so a client that collides is refused; what
+            # is under test is how many daemons they started between them.
+            if p.returncode == 2:
+                self.assertIn(b"already being checked", err)
+            else:
+                self.assertEqual(p.returncode, 0, err)
+        self.assertIn(0, codes, codes)
         time.sleep(1.0)
         self.assertEqual(_daemons_for(self.a.dir), 1,
                          "expected exactly one daemon serving the tree")

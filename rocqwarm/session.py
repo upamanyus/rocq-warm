@@ -1,27 +1,15 @@
 """A warm `rocq repl` session parked inside one .v file.
 
-The session keeps a Rocq REPL alive with the file already executed, remembers
-where every sentence started and which STM state it ran from, and on the next
-check replays only from the first sentence the edit could have touched.
+Keeps a Rocq REPL alive with the file already executed, remembering where each
+sentence starts and which STM state it ran from, so a check replays only from
+the first sentence the edit could have touched.  `BackTo` restores the whole
+system state, the parser after a `Notation` included, which is what makes the
+prefix reusable.
 
-`BackTo` restores the *whole* system state -- verified experimentally against
-Rocq 9.0.1 for `Require`, `Notation` (the parser itself), `Ltac` and
-`Set`/`Unset` -- which is what makes the prefix genuinely reusable rather than
-merely "probably fine".
-
-Everything a sentence printed comes back with it, so the `Show.` added to see a
-stuck goal is answered -- and it is answered by a warm session, which is the
-whole point: the reason to look at a goal is that the proof is stuck, which is
-exactly when a cold run of the file is least affordable.  Nothing is silenced
-to achieve that and nothing extra is asked of Rocq; the output was always in
-the stream, and a check simply stops filtering the part that belongs to the
-sentences it executed.  See `PROLOGUE` for what `Set Silent.` does and does not
-suppress, which is not what its name suggests.
-
-The prefix's output is not reported.  It printed nothing this time round, and
-re-printing a goal from three edits ago next to one just computed is worse than
-leaving it out; errors and warnings are the exception, since `coqc` would
-report them for this version of the file.
+A check reports what the sentences it executed printed, a `Show.` among them,
+by no longer filtering that part of the stream.  The reused prefix's output is
+not reported, since it printed nothing this time round; its errors and
+warnings are, because `coqc` reports them for this version of the file.
 """
 
 import errno
@@ -36,50 +24,38 @@ from . import diag as diagmod
 from . import project
 from . import protocol
 
-# `Set Silent.` does not mean what its name suggests, and what it does depends
-# on the version.  It sets `Flags.quiet`, which gates two different things: the
-# goal `coqloop` prints after every sentence that changed the proof, and the
-# `if_verbose` messages ("foo is defined").  It does NOT gate what a sentence
-# prints on request: `Show`, `Check` and the `Print` family (`Print
-# Assumptions` among them) go through `msg_notice`, which `Flags.quiet` has
-# never touched -- checked in `vernac/vernacentries.ml` at both 9.0 and 9.2.
-# `Time`'s "Finished transaction" was not traced to its emitter, so do not
-# count on it under a version where the option bites.
+# Sets `Flags.quiet`, which gates the goal `coqloop` prints after every
+# sentence that changed the proof, and the `if_verbose` messages ("foo is
+# defined").  It does NOT gate what a sentence prints on request: `Show`,
+# `Check` and the `Print` family go through `msg_notice`, which `Flags.quiet`
+# does not touch on 9.0 or 9.2.  `Time`'s "Finished transaction" has no known
+# emitter, so it is not relied on where the option bites.
 #
-# On 9.0 and 9.1 it gates both, and the goal print is the expensive one:
-# formatting a full Iris goal after each of a few thousand sentences costs more
-# than the proof does, and without this the REPL runs about 3x slower than
-# `coqc`.  On 9.2 it gates neither -- the option no longer takes effect when
-# set from the REPL, and the goal print is skipped for `-emacs` clients however
-# it is set.  So this line is load-bearing on 9.0/9.1 and a no-op on 9.2, and
-# either way it costs us nothing we want: a check reports what its sentences
-# printed because it stops FILTERING that output, not because of this.
+# Load-bearing on 9.0/9.1, where the goal print costs more than the proof does
+# (about 3x `coqc` without it).  Inert on 9.2, which ignores the option when it
+# is set from the REPL and skips the goal print for `-emacs` clients anyway.
 PROLOGUE = b"Set Silent.\n"
 
-# A sentinel must PARSE (a parse error emits no Chars line at all), execute,
-# succeed, and be unmistakable in the truncated `[...]` display.  `Locate` on an
-# unknown name does all four: it prints "No object of basename ..." and moves
-# the state on.  `Print`/`Check` on an unknown name FAIL, and `Print Rocq
-# Version.` does not parse.
+# A sentinel must parse (a parse error emits no Chars line), execute, succeed,
+# and be unmistakable in the truncated `[...]` display.  `Locate` on an unknown
+# name does all four; `Print`/`Check` on one fails instead.
 SENTINEL_FMT = "Locate rocq_warm_snt_%d."
 
-# How far ahead of Rocq's reported parse position we are willing to write.  It
-# must exceed the largest single sentence -- ProofIput.v has one of 13575 bytes
-# -- plus whatever Rocq's own input channel buffers, or the feed deadlocks:
-# Rocq cannot report a sentence it has not finished reading.  The window grows
-# on its own when it turns out to be too small (see `_write_all`), so this is
-# only a starting guess; it is small on purpose, because on an error everything
-# already in flight still gets executed before we can stop.
+# How far past Rocq's reported parse position we will write.  Must exceed the
+# largest single sentence (real files reach 13.5 KB) plus whatever Rocq's input
+# channel buffers, or the feed deadlocks: Rocq cannot report a sentence it has
+# not finished reading.  Only a starting guess, since `_write_loop` widens it
+# when it proves too small, and small on purpose: on an error everything
+# already in flight still executes.
 DEFAULT_WRITE_AHEAD = 16384
 MAX_WRITE_AHEAD = 1 << 21
 STALL_GRACE = 1.0
 DEFAULT_IDLE_KILL = 20.0        # seconds of zero CPU while input is owed
 
-# How long one command must run, behind an error, before we interrupt it.  It
-# has to be long enough that formatting a large Iris goal never looks like a
-# stuck tactic: printing burns CPU without advancing the parse, and a SIGINT
-# that lands during printing is fatal rather than catchable.  A pathological
-# `vm_compute` runs for minutes, so there is plenty of room.
+# How long one command must run, behind an error, before it is interrupted.
+# Long enough that formatting a large goal is not mistaken for a stuck tactic:
+# printing burns CPU without advancing the parse, and a SIGINT during printing
+# is fatal rather than catchable.
 INTERRUPT_STALL = 2.0
 
 
@@ -100,36 +76,24 @@ class MemoryLimit(Exception):
 
 
 class Session:
-    def __init__(self, path, flags, cwd=None, write_ahead=DEFAULT_WRITE_AHEAD,
-                 env=None, rss_limit=None, rocq="rocq", toolchain=None):
+    def __init__(self, path, flags, cwd=None, env=None, rss_limit=None,
+                 rocq="rocq", toolchain=None):
         self.path = os.path.abspath(path)
         self.flags = list(flags)
         self.cwd = cwd or os.path.dirname(self.path)
-        self.write_ahead = write_ahead
+        self.write_ahead = DEFAULT_WRITE_AHEAD
         self.env = env
-        # What this session can answer for, and what it has answered against.
-        # Both belong to the process, not to the daemon's table: a session
-        # spawned for these flags and this switch cannot be reused for others,
-        # and the libraries below are the ones THIS `rocq repl` loaded.  Held
-        # here, they cannot outlive it.
+        # The flags and switch this session can answer for; it cannot be
+        # reused for others, since both are fixed at spawn time.
         self.toolchain = toolchain
         # .vo path -> (mtime_ns, size) as each was when this session loaded it.
         # Refilled after every check from what Rocq says it has loaded.
         self.loaded = {}
-        # How many libraries that was.  The name -> path map that saves the
-        # work is `_libmap` below; this is only for `status` to show against
-        # `len(loaded)`, which is deliberately the wider set.
-        self.library_count = 0
-        # The absolute `rocq` the CLIENT resolved, not whatever is on the
-        # daemon's PATH.  A daemon outlives the shell that started it, and on a
-        # machine with several opam switches the next caller may well be in a
-        # different one.
+        # The absolute `rocq` the client resolved, not whatever is on the
+        # daemon's PATH: a daemon outlives the shell that started it, and the
+        # next caller may be in a different opam switch.
         self.rocq = rocq
-        # A ceiling, checked while a check is running.  This tree has had a
-        # `vm_compute` on a goal with a free variable reach 31 GB in six
-        # minutes; a daemon that keeps such a session resident is worse than no
-        # daemon.  None disables it.
-        self.rss_limit = rss_limit
+        self.rss_limit = rss_limit  # killed above this mid-check; None to disable
         self.proc = None
         self.buf = b""              # output from the last complete prompt on
         self.stream_written = 0     # bytes ever written to Rocq's stdin
@@ -139,7 +103,6 @@ class Session:
         self._sentinel = 0
         self._stop_writing = threading.Event()
         self._write_done = threading.Event()
-        self._reader = None
         self._cv = threading.Condition()
         self.complete = False
         self.text_being_fed = b""
@@ -149,8 +112,8 @@ class Session:
     # ---------------------------------------------------------------- process
 
     def start(self):
-        # A previous child may be dead but still holding its pipes; `stop` is a
-        # no-op when there is none.
+        # A previous child may be dead and still holding its pipes.  `stop` is
+        # a no-op when there is none.
         self.stop()
         argv = [self.rocq, "repl", "-emacs", "-q", "-time",
                 "-topfile", self.path] + self.flags
@@ -167,8 +130,7 @@ class Session:
         self.complete = False
         self._libmap = {}
         self._stop_writing.clear()
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader.start()
+        threading.Thread(target=self._read_loop, daemon=True).start()
         self._await(lambda: protocol.PROMPT_RE.search(self.buf) is not None,
                     timeout=120, what="banner")
         self._trim_to_last_prompt()
@@ -204,10 +166,9 @@ class Session:
     def loaded_changed(self):
         """Has any .vo this session holds been rebuilt, removed or replaced?
 
-        The cache-invalidation test, and the reason a session is ever thrown
-        away: answering for a library that was replaced on disk an hour ago is
-        worse than not answering.  A missing file fingerprints as `(None,
-        None)`, so deletion and rebuild are the same comparison.
+        A session that answers true is discarded rather than left answering
+        for a library that no longer matches its source.  A missing file
+        fingerprints as `(None, None)`, so deletion and rebuild compare alike.
         """
         now = project.fingerprint(sorted(self.loaded))
         return any(self.loaded[p] != (m, sz) for p, m, sz in now)
@@ -215,11 +176,9 @@ class Session:
     def live_pid(self):
         """The child's pid, or None if there is no live child.
 
-        `proc` is read ONCE.  Callers outside the thread that owns this session
-        -- the pid file, `status` -- would otherwise test `alive` and then read
-        `proc.pid`, and a `stop()` landing between the two raises
-        `AttributeError` on None, which is not the `OSError` those callers
-        guard against.
+        `proc` is read once, so that a concurrent `stop()` cannot land between
+        an `alive` test and a `proc.pid` read.  Callers outside the owning
+        thread guard against `OSError`, not the `AttributeError` that would be.
         """
         proc = self.proc
         if proc is None or proc.poll() is not None:
@@ -234,9 +193,8 @@ class Session:
             return 0
 
     def _cpu_ticks(self):
-        """utime+stime.  A Rocq blocked on stdin does not burn CPU; a runaway
-        tactic does.  That is how we tell 'waiting for more input' apart from
-        'this tactic is going to take ten minutes'."""
+        """utime+stime.  A Rocq blocked on stdin burns no CPU and a running
+        tactic does, which is how the two are told apart."""
         try:
             with open("/proc/%d/stat" % self.proc.pid) as f:
                 fields = f.read().rsplit(")", 1)[1].split()
@@ -276,11 +234,11 @@ class Session:
                 self._cv.wait(min(left, 0.5))
 
     def _death_note(self, when):
-        """Why the child is gone, in the words that tell the two cases apart.
+        """Why the child is gone.
 
-        A negative return code is a signal, and which one matters: -9 is the
-        OOM killer or somebody's `pkill`, -15 is a deliberate terminate.  Both
-        look identical in the transcript, and neither is a bug in the proof.
+        A negative return code is a signal: -9 the OOM killer or a `pkill`,
+        -15 a deliberate terminate.  Neither is a bug in the proof, and they
+        are indistinguishable in the transcript without this.
         """
         rc = self.proc.poll() if self.proc is not None else None
         if rc is not None and rc < 0:
@@ -316,12 +274,11 @@ class Session:
             self._cv.notify_all()
 
     def _write_all(self, data):
-        """Write with a bounded look-ahead so an error stops the feed promptly.
+        """Write with a bounded look-ahead, and mark the write finished.
 
-        Rocq only tells us how far it has parsed, so we keep at most
-        `write_ahead` bytes of unparsed input in flight.  Without this, a
-        failure at the top of a file would still let Rocq re-prove everything
-        below it out of the pipe buffer.
+        At most `write_ahead` bytes of unparsed input are in flight, so a
+        failure near the top of a file cannot let Rocq re-prove the rest out
+        of the pipe buffer.
         """
         self._write_done.clear()
         try:
@@ -342,10 +299,9 @@ class Session:
                         return
                     self._cv.wait(0.2)
                     if time.time() - blocked_since > STALL_GRACE:
-                        # Rocq is not reporting progress and is not asking for
-                        # anything: the window is smaller than the sentence it
-                        # is trying to read.  Widen it -- permanently, so the
-                        # session learns this file's shape once.
+                        # No progress and nothing asked for: the window is
+                        # smaller than the sentence Rocq is reading.  Widen it
+                        # for the rest of the session.
                         if self.write_ahead < MAX_WRITE_AHEAD:
                             self.write_ahead *= 2
                             blocked_since = time.time()
@@ -369,27 +325,25 @@ class Session:
     # ------------------------------------------------------------------ feed
 
     def _feed_raw(self, data, timeout, stop_on_error=False):
-        """Feed `data`, wait for it all to be executed, return the sentences.
+        """Feed `data`, wait for it to execute, return its sentences.
 
-        A trailing sentinel makes 'done' an exact signal rather than a
-        quiescence guess: a slow tactic and a finished feed look identical from
-        the outside otherwise.
+        A trailing sentinel makes "done" exact: a slow tactic and a finished
+        feed are otherwise indistinguishable from outside.
         """
         self._sentinel += 1
         sentinel = (SENTINEL_FMT % self._sentinel)
         sentinel_pat = re.compile(
             rb'Chars \d+ - \d+ \[' + re.escape(sentinel.replace(" ", "~").encode()) + rb'\]')
         payload = data + b"\n" + sentinel.encode() + b"\n"
-        # Size the window from the largest sentence this file has actually
-        # shown us, rather than letting it ratchet upwards for ever: everything
-        # in the window still executes when a sentence fails, so the smallest
-        # window that cannot deadlock is the one we want.
+        # Sized from the largest sentence this file has shown, rather than
+        # ratcheting: everything in the window still executes when a sentence
+        # fails, so the smallest window that cannot deadlock is the right one.
         biggest = max((x.end - x.start for x in self.sentences), default=0)
         self.write_ahead = max(DEFAULT_WRITE_AHEAD, 2 * biggest + 8192)
         base = self.stream_written
         self._stop_writing.clear()
-        # Clear before the thread starts, so the waiter cannot observe the
-        # previous feed's flag and skip error detection.
+        # Cleared before the thread starts, or the waiter observes the
+        # previous feed's flag and skips error detection.
         self._write_done.clear()
         writer = threading.Thread(target=self._write_all, args=(payload,), daemon=True)
         writer.start()
@@ -398,21 +352,18 @@ class Session:
                 stopped_early = self._await_sentinel(
                     sentinel_pat, timeout, stop_on_error)
             except Unterminated:
-                # Everything was written and Rocq is still waiting: the text
-                # ended inside a sentence, a comment or a string, and our
-                # sentinel went in after it.  Close it off before reporting,
-                # or the NEXT feed -- a `BackTo`, a query -- lands inside it too
-                # and the session is lost for a check that was never going to
-                # pass anyway.
+                # All written and Rocq still waiting: the text ended inside a
+                # sentence, comment or string, swallowing the sentinel.  Close
+                # it before reporting, or the next feed lands inside it too.
                 self._stop_writing.set()
                 writer.join(timeout=10)
                 self._recover(data, base, timeout)
                 self._trim_to_last_prompt()
                 raise
             if stopped_early:
-                # We stopped mid-chunk, so Rocq is waiting for the rest of a
-                # sentence and will never reach the sentinel we queued.  Close
-                # whatever is lexically open, terminate, and re-send it.
+                # Stopped mid-chunk, so Rocq waits for the rest of a sentence
+                # and never reaches the queued sentinel.  Close what is
+                # lexically open, terminate, and re-send it.
                 self._stop_writing.set()
                 writer.join(timeout=10)
                 self._interrupt_stalled_work()
@@ -422,8 +373,8 @@ class Session:
             writer.join(timeout=10)
         segments, _ = protocol.split_prompts(self.buf)
         items = protocol.parse_segments(segments)
-        # Anything Rocq reported from before this chunk began is left over from
-        # the previous feed and its offsets belong to a different chunk.
+        # Anything from before this chunk began belongs to the previous feed,
+        # and its offsets are measured from a different base.
         items = [it for it in items
                  if not isinstance(it, protocol.Sentence)
                  or it.stream_start >= base]
@@ -439,9 +390,8 @@ class Session:
         return items, base
 
     def _recover(self, data, base, timeout):
-        """Close whatever of `data` is lexically open, terminate the
-        sentence Rocq is waiting on, and bring it back to a prompt.  Returns
-        the sentinel that marks the recovery."""
+        """Close what is lexically open in `data`, terminate the sentence Rocq
+        is waiting on, and return to a prompt.  Returns the new sentinel."""
         consumed = self.stream_written - base
         depth, in_string = self.lex_state(data[:consumed])
         recovery = (b'"' if in_string else b"") + b" *)" * depth + b" .\n"
@@ -457,15 +407,13 @@ class Session:
     def _sigint(self):
         """Interrupt the command Rocq is running.
 
-        Rocq only protects itself from `Sys.Break` while it is *executing*; a
-        signal that lands while it is reading input, printing a prompt, or
-        FORMATTING A LARGE GOAL kills it outright (`Fatal error: exception
-        Stdlib.Sys.Break`).  That last one is not hypothetical -- an Iris error
-        context takes a noticeable time to print, during which Rocq burns CPU
-        and reports no new sentence, which looks exactly like a stuck tactic.
-        So callers must have established all three: burning CPU, no new
-        sentence, and **no new output**, for `INTERRUPT_STALL` seconds.  Never
-        send this on spec.
+        Rocq protects itself from `Sys.Break` only while executing; a signal
+        arriving while it reads input, prints a prompt, or formats a large
+        goal kills it outright (`Fatal error: exception Stdlib.Sys.Break`).
+        Formatting is the dangerous case, because it burns CPU and reports no
+        new sentence, exactly like a stuck tactic.  So a caller must first
+        have all three for `INTERRUPT_STALL` seconds: CPU burning, no new
+        sentence, and no new output.
         """
         try:
             os.kill(self.proc.pid, signal.SIGINT)
@@ -473,22 +421,15 @@ class Session:
             pass
 
     def _interrupt_stalled_work(self, limit=60.0):
-        """SIGINT a single command that is running long behind an error.
+        """SIGINT a single command running long behind an error.
 
-        Once a sentence has failed, the input already in flight still executes
-        -- against a goal of the wrong shape, which is how a `vm_compute` ends
-        up on a free variable and reaches tens of GB (`ProofIsmapped.v`
-        has 70 of them in 489 lines).  Rocq turns SIGINT into
-        `Error: User interrupt.` and carries on with the next sentence.
+        Once a sentence has failed, the input already in flight still executes,
+        against a goal of the wrong shape: that is how a `vm_compute` ends up
+        on a free variable and eats tens of GB.  Rocq turns SIGINT into
+        `Error: User interrupt.` and carries on.
 
-        The predicate matters.  Rocq only protects itself from `Sys.Break`
-        while it is *executing* a command; a signal that lands while it is
-        reading input or printing a prompt kills the process outright
-        (`Fatal error: exception Stdlib.Sys.Break`).  So signal only when it is
-        burning CPU AND has not reported a new sentence for a while -- which is
-        exactly "one command has been running a long time", and never the gap
-        between two fast ones.  Short sentences are left to finish; they are
-        cheap, and they are not the problem.
+        Signals only on `_sigint`'s predicate, which holds when one command
+        has run a long time and not between two fast ones.
         """
         deadline = time.time() + limit
         idle_since = None
@@ -515,35 +456,28 @@ class Session:
                 stuck_since = now
 
     def _await_sentinel(self, pat, timeout, stop_on_error=False):
-        """Wait for the sentinel AND the prompt that follows it.
+        """Wait for the sentinel and the prompt that follows it.
 
-        Waiting only for the sentinel's own `Chars` line is a race: the prompt
-        after it may not have arrived, `_trim_to_last_prompt` then keeps the
-        sentinel in the buffer, and the NEXT feed parses it as one of its own
-        sentences -- with stream offsets from the previous chunk.  That
-        corrupts the sentence map and makes the following replay resume in the
-        middle of a sentence.  It is timing-dependent, so it shows up as a
-        flake rather than a failure.
+        Both, because on the sentinel's `Chars` line alone the following prompt
+        may not have arrived; `_trim_to_last_prompt` then leaves the sentinel
+        in the buffer and the next feed parses it as one of its own sentences,
+        with offsets from the previous chunk.  That corrupts the sentence map
+        and makes the next replay resume mid-sentence.
         """
         def done():
             m = pat.search(self.buf)
             return m is not None and protocol.PROMPT_RE.search(self.buf, m.end())
 
         def hit_error():
-            """A sentence that failed leaves the state id where it was.
-
-            Spotting that DURING the feed is what makes a broken proof cheap:
-            otherwise Rocq happily re-proves the whole rest of the file behind
-            an error we already know about.
+            """Has a sentence failed?  Spotted during the feed, so Rocq does
+            not re-prove the rest of the file behind a known error.
 
             A standing state id is necessary but not sufficient: a bare
-            `Show.` -- which `coqloop` answers itself, without putting anything
-            in the document -- leaves it standing too, and stopping the feed
-            there would abandon the check over the goal the user asked to see.
-            So require Rocq's own `Error:` in the same segment.  Sound for the
-            same reason it would be unsound as a general verdict signal: a
-            proof's own `idtac` can print "Error:", but a sentence that prints
-            anything at all has advanced the state id.
+            `Show.`, which `coqloop` answers without putting anything in the
+            document, leaves it standing too.  So Rocq's own `Error:` must
+            appear in the same segment.  That pairing is sound even though
+            `Error:` alone is not, because any sentence that printed at all
+            advanced the state id.
             """
             for before, after, seg in protocol.split_prompts(self.buf)[0]:
                 if before == after and protocol.ERROR_RE.search(seg):
@@ -583,50 +517,41 @@ class Session:
             ticks = self._cpu_ticks()
             if ticks is None or ticks != last_ticks:
                 if error_seen and now - stuck_since > INTERRUPT_STALL:
-                    # One command has been running a long time behind an error
-                    # we already know about, on a goal of the wrong shape, and
-                    # is producing no output while it does.  See `_sigint` for
-                    # why the predicate has to be that narrow.
+                    # One command running long behind a known error, on a goal
+                    # of the wrong shape, printing nothing.  See `_sigint` for
+                    # why the predicate must be that narrow.
                     self._sigint()
                     stuck_since = now
                 last_ticks, last_move = ticks, now
             elif (self._write_done.is_set()
                   and now - last_move > DEFAULT_IDLE_KILL):
-                # Rocq is burning no CPU and still owes us a sentinel: it is
-                # blocked reading stdin, which means the text we fed ended in
-                # the middle of a sentence and swallowed the sentinel too.
+                # No CPU and a sentinel still owed: Rocq is blocked reading
+                # stdin, so the text ended mid-sentence and swallowed it.
                 raise Unterminated(
                     "end of file inside an unterminated sentence")
 
     # --------------------------------------------------------------- mapping
 
     def _absorb(self, items, base, file_start, file_end):
-        """Attach .v byte offsets, and the anchor each message is relative to.
+        """Attach .v byte offsets, and the anchor each message is measured from.
 
-        Rocq's Chars counter is a running offset into everything ever written to
-        its stdin, so the stream offset at which this chunk began is what turns
-        a Chars range into a file range.
+        Rocq's Chars counter runs over everything ever written to its stdin, so
+        the stream offset where this chunk began converts a Chars range into a
+        file range.
 
-        The anchor is subtler and is the thing that makes locations agree with
-        `coqc`.  `Toplevel input, characters A-B` is measured from a line start
-        that is neither the sentence's nor the error's: Rocq consumes the
-        whitespace after a sentence's terminating `.` and takes the line it
-        lands on.  So
+        A message's own offsets are measured from neither the sentence nor the
+        error line: Rocq consumes the whitespace after a sentence's `.` and
+        anchors on the line it lands on.  So
 
-          * whitespace-then-newline after the previous sentence -> the anchor is
-            just past that FIRST newline, and further blank lines, indentation
-            and comment blocks before the sentence all count into A;
-          * anything else first -- a trailing comment on the previous line, or a
-            second sentence on the same line -- and the anchor stays on the
-            PREVIOUS sentence's line.
+          * whitespace then a newline -> just past that first newline, and
+            further blank lines, indentation and comment blocks before the
+            sentence count into the offset;
+          * anything else first, a trailing comment or a second sentence on
+            the same line -> the previous sentence's line.
 
-        The second case is not exotic: `Require Import WpInstr.   (* ... *)` is
-        ordinary style here, and getting it wrong shifts every column on the
-        following sentence by the width of the comment.  For the first sentence
-        of a chunk the previous "sentence" is our own sentinel, which we always
-        follow with a newline, so the anchor is exactly where the chunk begins.
-        Derived by solving for it over the shapes in
-        `tests/test_rocq_warm_diag.py`, each re-checked against a live `coqc`.
+        The second case shifts every column on the following sentence by the
+        width of the comment.  A chunk's first sentence follows this module's
+        sentinel, always newline-terminated, so its anchor is the chunk start.
         """
         text = self.text_being_fed
         for it in items:
@@ -636,7 +561,7 @@ class Session:
         prev_end = None
         for i, it in enumerate(items):
             if not isinstance(it, protocol.Sentence):
-                # No Chars line, so no range of its own: a parse error, or a
+                # No Chars line, so no range of its own: a parse error or a
                 # toplevel-only command such as a bare `Show.`.
                 it.start = diagmod.skip_blanks(
                     text, file_start if prev_end is None else prev_end)
@@ -668,11 +593,11 @@ class Session:
 
     @staticmethod
     def blank_or_comment(chunk):
-        """True if `chunk` is nothing but whitespace and balanced comments.
+        """True if `chunk` is only whitespace and balanced comments.
 
-        Rocq comments nest, and a string inside a comment hides a `*)`, so this
-        follows the lexer's rules.  Used only to prove an edit cannot have
-        changed the sentence structure -- a false negative just costs a replay.
+        Rocq comments nest and a string inside one hides a `*)`, so this
+        follows the lexer.  Used only to prove an edit cannot have changed the
+        sentence structure; a false negative costs a replay and nothing more.
         """
         i, n, depth = 0, len(chunk), 0
         while i < n:
@@ -699,11 +624,9 @@ class Session:
     def lex_state(chunk):
         """(comment_depth, in_string) at the end of `chunk`.
 
-        Needed to cut a feed short safely.  Stopping mid-sentence leaves Rocq
-        waiting for the rest of it, so we have to hand it a terminator -- and a
-        bare `.` is not a terminator inside a comment or a string.  Knowing the
-        exact lexical state lets us close whatever is open and then terminate,
-        instead of guessing with a ladder of escapes.
+        Cutting a feed short leaves Rocq waiting for the rest of a sentence, so
+        it must be handed a terminator, and a bare `.` is not one inside a
+        comment or a string.  The exact lexical state says what to close first.
         """
         i, n, depth, in_string = 0, len(chunk), 0, False
         while i < n:
@@ -728,13 +651,11 @@ class Session:
         rb'^\s*(?:From\s+\S+\s+)?(?:Require|Declare\s+ML\s+Module|Load)\b')
 
     def _unsafe_to_undo(self, index):
-        """Is any sentence at or after `index` one we would rather not undo?
+        """Is any sentence at or after `index` one not worth undoing?
 
-        Experimentally `BackTo` does undo a `Require` correctly (the names go
-        away again), but unloading a library is the one place a warm session
-        could plausibly diverge from a cold `coqc`, and the only edits that
-        reach it are edits to the header -- where a cold start is the honest
-        answer anyway.  Cheap insurance, no real cost.
+        `BackTo` does undo a `Require` correctly, but unloading a library is
+        the one place a warm session could diverge from a cold `coqc`, and only
+        header edits reach it, where a cold start costs little.
         """
         for s in self.sentences[index:]:
             if self.UNSAFE_HEAD.match(self.text[s.start:s.end]):
@@ -774,9 +695,8 @@ class Session:
     def check(self, text, timeout=1800, _retry=True):
         """Execute `text`, reusing as much of the warm prefix as is sound.
 
-        If the child dies mid-check -- a neighbour's `pkill` on this shared
-        box, or our own interrupt landing in the wrong place -- that costs a
-        cold run, not an error.
+        A child that dies mid-check, from a neighbour's `pkill` or an interrupt
+        landing badly, costs a cold run rather than an error.
         """
         try:
             return self._check(text, timeout)
@@ -793,12 +713,12 @@ class Session:
         mode = plan[0]
 
         if mode == "shift":
-            # Every stored anchor from k on moves with the text -- including
-            # sentence k's, whose anchor sits in the gap that just changed.
-            # The anchor is not a semantic position here but the origin the
-            # CACHED message offsets were measured from, so it has to travel
-            # with the text they point into; recomputing it from the new gap
-            # leaves those offsets short by the gap's change in width.
+            # Every stored anchor from k on moves with the text, including
+            # sentence k's, which sits in the gap that changed.  An anchor here
+            # is the origin the cached message offsets were measured from, not
+            # a semantic position, so it must travel with the text they point
+            # into; recomputing it from the new gap leaves them short by the
+            # gap's change in width.
             _, delta, k = plan
             for s in self.sentences[k:]:
                 s.start += delta
@@ -845,15 +765,13 @@ class Session:
                 first_bad = i
                 break
         good = items[:first_bad] if first_bad is not None else items
-        # Warnings from the REUSED prefix have to be reported too.  A warm run
-        # never re-executes those sentences, so without this a replay silently
-        # drops every warning above the edit and stops matching `coqc`.
+        # The reused prefix's warnings, which a warm run never re-executes:
+        # without them a replay drops every warning above the edit and stops
+        # matching `coqc`.
         diags = self._prefix_diags()
-        # Then everything this check executed, in the order Rocq printed it,
-        # output and all -- the `Show` the user added to see the stuck goal is
-        # in here, and so is whatever the failing sentence printed on its way
-        # out.  A toplevel-only item (a bare `Show.`) never reaches the
-        # sentence map, so this list, not the map, is what carries it.
+        # Then everything this check executed, in Rocq's order, output
+        # included.  A toplevel-only item such as a bare `Show.` never reaches
+        # the sentence map, so this list carries it instead.
         executed = items if first_bad is None else items[:first_bad + 1]
         for it in executed:
             diags += _diags_of(it, include_info=True)
@@ -862,8 +780,8 @@ class Session:
             self.text = text
             self.complete = True
         else:
-            # Park the session exactly at the broken sentence, so that the next
-            # edit -- the fix for it -- replays from here and nothing before.
+            # Parked at the broken sentence, so the next edit, which is the fix
+            # for it, replays from here and nothing before.
             self.text = text[:items[first_bad].start]
             self.complete = False
             if self.sentences:
@@ -873,14 +791,9 @@ class Session:
                            total=len(self.sentences))
 
     def _prefix_diags(self):
-        """The errors and warnings of the sentences we are keeping.
-
-        Not their output.  A warm run does not re-execute the prefix, so
-        nothing in it printed anything this time round; replaying what it
-        printed several edits ago, next to a goal the session has just
-        computed, is worse than leaving it out.  Errors and warnings are
-        different -- `coqc` would report them for this version of the file,
-        and a replay that dropped them would stop matching it.
+        """The errors and warnings of the sentences being kept, not their
+        output: the prefix printed nothing this time round, while `coqc`
+        reports its diagnostics for this version of the file.
         """
         out = []
         for s in self.sentences:
@@ -908,13 +821,11 @@ class Session:
     def loaded_libraries(self, timeout=300):
         """{logical name: .vo path} for every library Rocq has loaded.
 
-        Asked of Rocq itself -- `Print Libraries.` for the names, `Locate
-        Library` for the files -- because that is the only source that knows.
-        `rocq dep` cannot see an installed library, nor a `Require` that was
-        added after the session started; the process that did the loading
-        can.  The queries are undone with `BackTo`, so the session is parked
-        exactly where it was.  A few hundred `Locate Library` queries cost
-        tens of milliseconds, and each name is asked about once per session.
+        Asked of Rocq, via `Print Libraries.` for the names and `Locate
+        Library` for the files, because `rocq dep` sees neither an installed
+        library nor a `Require` added after the session started.  The queries
+        are undone with `BackTo`, leaving the session parked where it was, and
+        each name is located once per session.
         """
         if not self.alive:
             return {}
@@ -965,16 +876,11 @@ INFOMSG_RE = re.compile(rb'<infomsg>.*?</infomsg>', re.S)
 def _split_messages(raw):
     """Split one sentence's output into individual message blobs.
 
-    Two boundaries, not one.  Errors and warnings are delimited by their
-    `Toplevel input, characters A-B:` location line, and `-emacs` wraps every
-    INFO message -- a definition's "foo is defined", a `Locate` result -- in
-    its own `<infomsg>...</infomsg>`.  Splitting on the location line alone
-    lets an info message that Rocq printed right after a warning ride along
-    inside the warning's blob, where it is classified as a warning and
-    rendered as part of it.  Honour the `<infomsg>` boundaries Rocq already
-    gives us, and each becomes the info blob it is -- reported as the output
-    it is when we just ran the sentence, dropped when it is a cached one's,
-    and never merged into a warning.
+    Two boundaries, not one: errors and warnings are delimited by their
+    `Toplevel input, characters A-B:` line, and `-emacs` wraps each info
+    message in `<infomsg>...</infomsg>`.  On the location line alone, an info
+    message printed just after a warning rides along inside the warning's blob
+    and is classified and rendered as part of it.
     """
     if not raw or not raw.strip():
         return []
@@ -1000,8 +906,8 @@ def _split_messages(raw):
 class Diag:
     """One error or warning, still carrying Rocq's raw blob.
 
-    The absolute span is not baked in here: it depends on the file text, which
-    the caller has and which `diag.locate` needs anyway.
+    The absolute span is not stored, since it depends on the file text that
+    the caller holds.
     """
 
     __slots__ = ("kind", "anchor", "raw")

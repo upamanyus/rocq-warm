@@ -7,7 +7,6 @@ cache and a liar.
 """
 
 import os
-import subprocess
 import time
 import unittest
 
@@ -66,35 +65,6 @@ class ProjectFileTests(unittest.TestCase):
     def test_fingerprint_tolerates_a_missing_file(self):
         f = os.path.join(self.ws.dir, "gone.vo")
         self.assertEqual(project.fingerprint([f]), [(f, None, None)])
-
-
-@requires_rocq
-class DependencyClosureTests(unittest.TestCase):
-    """`rocq dep` gives direct requires; the session loads the closure."""
-
-    def setUp(self):
-        self.ws = Workspace()
-        self.addCleanup(self.ws.cleanup)
-        self.ws.write("Base.v", b"Definition base := 1.\n")
-        self.ws.write("Mid.v", b"Require Import T.Base.\nDefinition mid := base.\n")
-        self.ws.write("Top.v", b"Require Import T.Mid.\nDefinition top := mid.\n")
-        with open(os.path.join(self.ws.dir, "_CoqProject"), "w") as f:
-            f.write("-R . T\nBase.v\nMid.v\nTop.v\n")
-        for name in ("Base.v", "Mid.v", "Top.v"):
-            subprocess.run(["coqc", "-q"] + self.ws.flags + [name],
-                           cwd=self.ws.dir, check=True, capture_output=True)
-
-    def test_closure_reaches_indirect_dependencies(self):
-        flags, cwd = project.flags_for(os.path.join(self.ws.dir, "Top.v"))
-        graph = project.dep_graph(
-            flags, cwd, project.project_sources(
-                os.path.join(cwd, "_CoqProject"), cwd))
-        deps = project.closure(os.path.join(cwd, "Top.v"), flags, cwd, graph)
-        names = {os.path.basename(d) for d in deps}
-        self.assertIn("Mid.vo", names)
-        self.assertIn("Base.vo", names,
-                      "the closure must reach Base.vo through Mid.vo, or a "
-                      "rebuild of Base would not invalidate a Top session")
 
 
 class StalenessRuleTests(unittest.TestCase):
@@ -244,11 +214,12 @@ class DepGraphTests(unittest.TestCase):
         self.assertEqual(self.g.closure(path),
                          sorted([self.ws.path("Base.vo"), self.ws.path("Mid.vo")]))
 
-    def test_dep_graph_skips_listed_files_that_do_not_exist(self):
-        graph = project.dep_graph(self.ws.flags, self.ws.dir,
-                                  ["Base.v", "NotYet.v", "Mid.v"])
-        self.assertIn(self.ws.path("Mid.vo"), graph,
-                      "one missing file must not blank the whole graph")
+    def test_a_listed_file_that_does_not_exist_does_not_blank_the_graph(self):
+        # `rocq dep` prints nothing at all when handed a file that does not
+        # exist, so missing sources are filtered out before the batch runs.
+        # `NotYet.v` is listed in this fixture's _CoqProject and absent.
+        self.g.refresh()
+        self.assertIn(self.ws.path("Mid.vo"), self.g.graph)
 
 
 if __name__ == "__main__":

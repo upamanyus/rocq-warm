@@ -1,21 +1,21 @@
-"""Turning REPL messages into `coqc`-format diagnostics.
+"""REPL messages rendered as `coqc`-format diagnostics.
 
 `rocq repl -emacs` reports a location as `Toplevel input, characters A-B:`,
-where A and B are byte offsets relative to an anchor that `Session._absorb`
-computes -- the start of the line on which Rocq resumed reading, which is
-neither the sentence nor the line the error is on.  Adding the anchor recovers
-the absolute position, and from there the rendering is `coqc`'s:
+where A and B are byte offsets from an anchor computed by `Session._absorb`:
+the start of the line on which Rocq resumed reading, which is neither the
+sentence nor the line the error is on.  Adding the anchor gives the absolute
+position; the rendering is then `coqc`'s:
 
     File "./Foo.v", line 9, characters 7-17:
     Error: The variable bogus_name was not found in the current environment.
 
-Verified against `coqc` for an execution error inside a multi-line sentence, an
-error whose span crosses a line break, and a parse error (which reports no
-sentence range at all).  `tests/test_rocq_warm_diag.py` re-checks all three
-against a live `coqc` rather than against a recorded string.
+Held to a live `coqc` by `tests/test_rocq_warm_diag.py`, including a span
+crossing a line break and a parse error, which reports no range at all.
 """
 
 import re
+
+from . import protocol
 
 LOC_RE = re.compile(rb'^Toplevel input, characters (\d+)-(\d+):$', re.M)
 
@@ -32,9 +32,9 @@ def line_number(text, off):
 def skip_blanks(text, i):
     """First byte at or after `i` that is neither whitespace nor a comment.
 
-    Rocq's comments nest and can contain strings that hide a `*)`; a parse
-    error carries no range of its own, so this is how we find where the
-    sentence it choked on actually began.
+    Where a sentence begins, which is how a parse error is located: it carries
+    no range of its own.  Rocq's comments nest, and a string inside one can
+    hide a `*)`.
     """
     n = len(text)
     while i < n:
@@ -63,11 +63,10 @@ def skip_blanks(text, i):
 def message_anchor(text, prev_end):
     """Where Rocq measures the next sentence's message offsets from.
 
-    See `Session._absorb` for what this is and why it matters.  Rocq skips the
-    whitespace after a sentence's `.`; if it crosses a newline the anchor is the
-    line it lands on, and if it meets anything else first -- a trailing comment,
-    or another sentence on the same line -- the anchor stays on the line the
-    previous sentence ended on.
+    Rocq skips the whitespace after a sentence's `.`.  Crossing a newline puts
+    the anchor on the line it lands on; meeting anything else first -- a
+    trailing comment, or another sentence on the same line -- leaves it on the
+    line the previous sentence ended on.
     """
     i, n = prev_end, len(text)
     while i < n and text[i:i + 1] in b" \t\r":
@@ -80,8 +79,7 @@ def message_anchor(text, prev_end):
 def locate(raw, anchor):
     """(abs_start, abs_end) for one message blob, or None if it has no location.
 
-    `anchor` is computed in `Session._absorb`; see the note there for what
-    Rocq's offsets are actually relative to.
+    `anchor` comes from `Session._absorb`.
     """
     m = LOC_RE.search(raw)
     if m is None or anchor is None:
@@ -89,12 +87,11 @@ def locate(raw, anchor):
     return anchor + int(m.group(1)), anchor + int(m.group(2))
 
 
-# `rocq repl` parses at the `vernac_toplevel` grammar entry (the one that also
-# accepts `BackTo`), so its syntax errors name that entry where `coqc` names
-# plain `vernac`.  Same error, same location, different word -- rewritten so a
+# `rocq repl` parses at the `vernac_toplevel` grammar entry, so its syntax
+# errors name that entry where `coqc` names plain `vernac`.  Rewritten so a
 # warm diagnostic is byte-identical to the batch one.
-REPL_WORDING = ((b"illegal begin of toplevel:vernac_toplevel",
-                 b"illegal begin of vernac"),)
+REPL_TOPLEVEL_ENTRY = b"illegal begin of toplevel:vernac_toplevel"
+BATCH_ENTRY = b"illegal begin of vernac"
 
 
 def strip_location(raw):
@@ -104,22 +101,16 @@ def strip_location(raw):
         if LOC_RE.match(line) or line.startswith(b"> "):
             continue
         out.append(line)
-    txt = b"\n".join(out)
-    for tag in (b"<infomsg>", b"</infomsg>", b"<warning>", b"</warning>"):
-        txt = txt.replace(tag, b"")
-    for repl_form, batch_form in REPL_WORDING:
-        txt = txt.replace(repl_form, batch_form)
-    return txt.strip()
+    txt = protocol.message_text(b"\n".join(out))
+    return txt.replace(REPL_TOPLEVEL_ENTRY, BATCH_ENTRY).strip()
 
 
 def line_col(text, span):
     """(line, first column, last column) for a byte span, as `coqc` counts.
 
-    Split out from `render` so that whoever HAS the text resolves the offsets
-    against it.  The daemon read the file and checked exactly those bytes; a
-    client that re-reads the file afterwards to resolve them is reading a
-    different file if the edit loop moved on, and silently reports the
-    diagnostic on the wrong line.
+    Resolved by whoever holds the text the span is into -- the daemon, against
+    the bytes it checked.  Re-reading the file to resolve them would place the
+    diagnostic against whatever the file says now.
     """
     if span is None:
         return None
@@ -131,8 +122,8 @@ def line_col(text, span):
 def render_at(display_path, where, body):
     """One diagnostic, byte-for-byte in `coqc`'s shape, from `line_col`."""
     if where is None:
-        # Rocq's message already carries its own `Error:`/`Warning:` prefix;
-        # all that is missing is a location, and there is none to give.
+        # The message carries its own `Error:`/`Warning:` prefix; only the
+        # location is missing, and there is none to give.
         return body
     line, first, last = where
     return 'File "%s", line %d, characters %d-%d:\n%s' % (
