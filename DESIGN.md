@@ -252,16 +252,34 @@ check of that file was refused as busy until it finished: up to the half-hour
 wall timeout, on the one file the person was working on.
 
 The notice is an **EOF on the connection**, not a signal and not a message.
-The protocol is one request and one reply, so a client has already sent
-everything it will ever send by the time the check starts, and a socket that
-becomes readable can only be saying that the peer is gone. That covers every
-way of dying, including the ones that run none of the client's own code — and
-it has to, because the daemon is detached into a session of its own, so a
-terminal's Ctrl+C never reaches it. One watcher thread per connection polls
-for the EOF and sets an event the check reads; it is started after the request
-is read and joined before the connection is closed, so nothing is ever left
-polling an fd that has been handed back to the kernel and reissued to somebody
-else.
+That covers every way of dying, including the ones that run none of the
+client's own code — and it has to, because the daemon is detached into a
+session of its own, so a terminal's Ctrl+C never reaches it. One watcher
+thread per connection polls for it and sets an event the check reads; it is
+started after the request is read and joined before the connection is closed,
+so nothing is ever left polling an fd that has been handed back to the kernel
+and reissued to somebody else. It never closes the connection itself: the
+request thread still has a reply to attempt on it, and an fd freed early is
+one another thread can be handed before that reply is written.
+
+The rule is actually broader than the EOF, and deliberately so: **anything
+arriving on the connection ends the request.** The protocol is one request and
+one reply, so a client has already sent everything it will ever send by the
+time the check starts; bytes behind that are a client speaking a protocol this
+daemon does not have, and not one to go on working for. Being strict is the
+cheap side of the trade now that abandoning a check keeps its session — a
+false positive costs the two seconds the interrupt takes — and it rules out
+two worse shapes than itself. Discarding the bytes instead would let a later
+second message on this connection, a pipelined request or an explicit cancel,
+be eaten in silence by the very thread that saw it; and a client that kept
+writing would keep the socket readable, so a watcher that consumed and carried
+on would spin on a core for as long as the client cared to talk.
+
+The read is still made, even though both outcomes mean the same thing, because
+it is what makes the readability real. `select` may in principle wake on
+nothing, and cancelling a check whose client is still waiting is the one false
+positive this must not produce; a read that would have blocked is the only way
+back into the poll.
 
 What the check does about it is what it already does behind an error: stop
 feeding, and SIGINT the running command once — and only once — the predicate

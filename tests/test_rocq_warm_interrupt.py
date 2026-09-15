@@ -102,20 +102,22 @@ class PeerWatchTests(unittest.TestCase):
         t.join(timeout=5)
         self.assertFalse(t.is_alive(), "the watcher kept polling after the EOF")
 
-    def test_a_client_that_talks_out_of_turn_is_not_a_gone_client(self):
-        """Readable is not the test; readable with nothing on it is.
+    def test_a_client_that_talks_out_of_turn_is_treated_as_gone(self):
+        """Anything arriving at all ends the request, not just an EOF.
 
-        Data arriving is a client saying something the protocol has no room
-        for, which is not our business and certainly not a departure.
+        The client has already sent everything the protocol gives it to send,
+        so bytes behind that are a client this daemon cannot account for.
+        Ending the request is both the honest answer and the cheap one, since
+        an abandoned check keeps its session; carrying on instead would leave
+        a second message on this connection to be swallowed in silence, and
+        would spin on a core for as long as a talkative client kept writing.
         """
-        self.watch()
+        t = self.watch()
         self.them.sendall(b"hello?")
-        time.sleep(0.2)
-        self.assertFalse(self.gone.is_set(), "unexpected data read as an EOF")
-
-        self.them.close()
         self.assertTrue(wait_for(self.gone.is_set, timeout=5),
-                        "and then missed the real EOF")
+                        "bytes after the request were passed over")
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive(), "the watcher kept polling")
 
     def test_the_watcher_stops_when_the_request_is_over(self):
         """It must be finished before the connection is closed.
@@ -170,17 +172,18 @@ class ServedRequestTests(unittest.TestCase):
                         "a watcher thread outlived its request")
 
     def test_a_request_with_bytes_behind_it_is_still_answered(self):
-        """The watcher consumes what it reads, so when it starts matters.
+        """The watcher reads, so when it starts is load-bearing.
 
         It is started only after the request has been parsed.  Started any
-        earlier, it would race `recv_msg` for the request's own bytes and
-        swallow some of them, and the daemon would answer a truncated request
-        or none at all -- with the client waiting for a reply that is never
-        coming.
+        earlier it would race `recv_msg` for the request's own bytes, take
+        some of them, and -- now that stray bytes end the request -- abandon a
+        check over the bytes that were asking for it.  The client would wait
+        for a reply that was never coming.
 
-        Trailing bytes are what the race would look like from outside, so they
-        are sent deliberately here: whichever thread gets them, the request in
-        front of them must still be answered.
+        Trailing bytes are what that race looks like from outside, so they are
+        sent deliberately: whichever thread gets them, the request in front of
+        them must still be answered.  A `ping` is the probe because it reads
+        no cancellation, which isolates the question to the framing.
         """
         us, t = self.serve({"cmd": "ping"})
         self.addCleanup(us.close)

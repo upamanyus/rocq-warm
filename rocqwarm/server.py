@@ -907,29 +907,38 @@ def _watch_peer(conn, gone, done, step=WATCH_POLL):
     the daemon gets that nobody is waiting any more.  Waiting for the client
     to say so instead would miss every way of dying that runs no code.
 
-    The EOF is unambiguous here because the protocol is one request and one
-    reply: the client has already sent everything it will ever send, so a
-    readable socket with nothing to read is the peer being gone.
+    The protocol is one request and one reply, so by the time this starts the
+    client has sent everything it will ever send.  **Anything at all arriving
+    on the connection therefore ends the request**: an EOF because the peer is
+    gone, and bytes because a client speaking a protocol this daemon does not
+    have is not one to go on working for.  One rule, and no judgement about
+    which surprises are benign.
 
-    **This CONSUMES what it reads**, which is safe for exactly one reason: the
-    connection is read once, by the `recv_msg` that must already have returned
-    before this thread starts, and never again.  So the only bytes this can
-    swallow are bytes nobody was going to read.  Two things follow.  A second
-    message on the same connection -- a pipelined request, an explicit cancel
-    -- would have to be parsed here rather than dropped, since this would
-    otherwise eat it silently.  And the ordering in `_serve_one` is
-    load-bearing: started before the request was parsed, this would race
-    `recv_msg` for the request's own bytes.
+    Treating stray bytes as a departure is the cheap side of the trade, now
+    that abandoning a check keeps its session: a false positive costs the
+    couple of seconds the interrupt takes and nothing else.  It also rules out
+    two worse shapes.  Discarding them instead would mean a second message on
+    this connection -- a pipelined request, an explicit cancel -- being eaten
+    in silence by the very thread that noticed it, where now it abandons the
+    check and says so in the log.  And a client that keeps writing would keep
+    this readable, so a loop that consumed and carried on would spin on a core
+    for as long as the client cared to talk.
 
-    Peeking instead would consume nothing, and is worse on both counts that
-    matter.  Bytes left in the buffer make `select` return readable for ever,
-    so the poll becomes a spin; and while they sit there they hide the EOF
-    behind them, so a client that said something odd and then died would never
-    be noticed -- which is the one thing this thread exists to notice.
+    The read itself stays, even though both outcomes mean the same thing,
+    because it is what makes the readability real: `select` may in principle
+    wake on nothing, and cancelling a live check is the one false positive
+    this must not produce.  `BlockingIOError` -- readable, then nothing there
+    -- is that case, and is the only way back into the loop.
+
+    What this must NOT do is close the connection.  `_serve_one` still holds
+    it and has a reply to attempt on it; a close here frees an fd number that
+    another thread can be handed in the meantime, and the reply would land in
+    a stranger's socket.  The close belongs to the owner, and a reply to a
+    client that has gone already fails harmlessly.
 
     Polled rather than left blocking in `recv`, so this thread is finished
-    before the connection is closed.  A `recv` still blocked on a closed fd
-    would wake on whatever the next thread put in its place.
+    before that close.  A `recv` still blocked on a closed fd would wake on
+    whatever the next thread put in its place.
     """
     while not done.is_set():
         try:
@@ -937,12 +946,13 @@ def _watch_peer(conn, gone, done, step=WATCH_POLL):
                 continue
             stray = conn.recv(4096, socket.MSG_DONTWAIT)
             if stray:
-                # A client talking out of turn, which the protocol has no room
-                # for.  Logged rather than passed over in silence: it is the
-                # symptom a mismatched client or a second message would show.
-                compile_mod.log("discarded %d byte(s) a client sent after its "
-                                "request", len(stray))
-                continue
+                # Logged, because "the client went away" is about to be the
+                # daemon's account of it and this is the part that would
+                # otherwise be missing: it did not go away, it said something
+                # unaccountable.
+                compile_mod.log("client sent %d byte(s) after its request, "
+                                "which the protocol has no room for; treating "
+                                "it as gone", len(stray))
         except BlockingIOError:
             continue                    # readable, then not: still connected
         except (OSError, ValueError):
