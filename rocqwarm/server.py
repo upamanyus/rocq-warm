@@ -909,8 +909,23 @@ def _watch_peer(conn, gone, done, step=WATCH_POLL):
 
     The EOF is unambiguous here because the protocol is one request and one
     reply: the client has already sent everything it will ever send, so a
-    readable socket with nothing to read is the peer being gone, and anything
-    else is a client talking out of turn, which is not our business.
+    readable socket with nothing to read is the peer being gone.
+
+    **This CONSUMES what it reads**, which is safe for exactly one reason: the
+    connection is read once, by the `recv_msg` that must already have returned
+    before this thread starts, and never again.  So the only bytes this can
+    swallow are bytes nobody was going to read.  Two things follow.  A second
+    message on the same connection -- a pipelined request, an explicit cancel
+    -- would have to be parsed here rather than dropped, since this would
+    otherwise eat it silently.  And the ordering in `_serve_one` is
+    load-bearing: started before the request was parsed, this would race
+    `recv_msg` for the request's own bytes.
+
+    Peeking instead would consume nothing, and is worse on both counts that
+    matter.  Bytes left in the buffer make `select` return readable for ever,
+    so the poll becomes a spin; and while they sit there they hide the EOF
+    behind them, so a client that said something odd and then died would never
+    be noticed -- which is the one thing this thread exists to notice.
 
     Polled rather than left blocking in `recv`, so this thread is finished
     before the connection is closed.  A `recv` still blocked on a closed fd
@@ -920,8 +935,14 @@ def _watch_peer(conn, gone, done, step=WATCH_POLL):
         try:
             if not select.select([conn], [], [], step)[0]:
                 continue
-            if conn.recv(4096, socket.MSG_DONTWAIT):
-                continue                # talking out of turn; not an EOF
+            stray = conn.recv(4096, socket.MSG_DONTWAIT)
+            if stray:
+                # A client talking out of turn, which the protocol has no room
+                # for.  Logged rather than passed over in silence: it is the
+                # symptom a mismatched client or a second message would show.
+                compile_mod.log("discarded %d byte(s) a client sent after its "
+                                "request", len(stray))
+                continue
         except BlockingIOError:
             continue                    # readable, then not: still connected
         except (OSError, ValueError):

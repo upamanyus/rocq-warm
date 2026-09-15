@@ -169,6 +169,30 @@ class ServedRequestTests(unittest.TestCase):
                                  timeout=5),
                         "a watcher thread outlived its request")
 
+    def test_a_request_with_bytes_behind_it_is_still_answered(self):
+        """The watcher consumes what it reads, so when it starts matters.
+
+        It is started only after the request has been parsed.  Started any
+        earlier, it would race `recv_msg` for the request's own bytes and
+        swallow some of them, and the daemon would answer a truncated request
+        or none at all -- with the client waiting for a reply that is never
+        coming.
+
+        Trailing bytes are what the race would look like from outside, so they
+        are sent deliberately here: whichever thread gets them, the request in
+        front of them must still be answered.
+        """
+        us, t = self.serve({"cmd": "ping"})
+        self.addCleanup(us.close)
+        us.sendall(b"a second thing nobody asked for")
+
+        resp = server_mod.recv_msg(us)
+        self.assertIsNotNone(resp, "the request went unanswered")
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual(resp["pid"], os.getpid())
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive(), "the request never finished")
+
     def test_a_client_gone_before_the_check_starts_spawns_nothing(self):
         """The cheapest interrupt to honour, and the easiest to miss.
 
