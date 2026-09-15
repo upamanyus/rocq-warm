@@ -4,9 +4,10 @@ On the daemon's side of the socket, where the evidence is: the bytes checked,
 the workspace root, and the compile job.  The client writes these two strings
 and exits with this code.
 
-Exit codes: 0 the file checks, 1 it does not, 2 it was never checked, 3 a green
-verdict that a real `rocq compile` rejected.  Callers act on the difference
-between 1 and 2, so it is decided once, here.
+The exit code is decided here, once, because callers act on the difference
+between 1 -- the proof is wrong -- and 2, which is no verdict about the proof
+at all.  `client.CHECK_EPILOG` spells the codes out, and is what `check
+--help` prints.
 """
 
 import os
