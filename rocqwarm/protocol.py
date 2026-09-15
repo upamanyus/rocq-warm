@@ -106,10 +106,6 @@ class Untimed:
         self.end = None
         self.anchor = None
 
-    state_after = property(lambda self: self.state_before)
-    display = property(
-        lambda self: b"<parse error>" if self.failed else b"<toplevel command>")
-
     def __repr__(self):
         return "Untimed(%s-%s%s)" % (self.start, self.end,
                                      " FAILED" if self.failed else "")

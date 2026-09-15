@@ -13,7 +13,7 @@ import subprocess
 import time
 import unittest
 
-from rocq_warm_helpers import TOOLS, Workspace, requires_rocq
+from rocq_warm_helpers import TOOLS, Workspace, alive, requires_rocq
 from rocqwarm import server
 
 CLI = os.path.join(TOOLS, "rocq-warm")
@@ -279,15 +279,7 @@ Qed.
                                   cwd=self.ws.dir, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE)
                  for _ in range(4)]
-        codes = []
-        for p in procs:
-            _out, err = p.communicate(timeout=300)
-            codes.append(p.returncode)
-            if p.returncode == 2:
-                self.assertIn(b"already being checked", err)
-            else:
-                self.assertEqual(p.returncode, 0, err)
-        self.assertIn(0, codes, codes)
+        _verdict_or_busy(self, procs)
         self.assertEqual(self.check().returncode, 0, "the stream was disturbed")
 
     def test_killing_the_daemon_takes_its_idle_sessions_with_it(self):
@@ -300,9 +292,9 @@ Qed.
         self.assertTrue(pids, "no session pid reported")
         os.kill(self.daemon_pid(), signal.SIGKILL)
         deadline = time.time() + 20
-        while time.time() < deadline and any(_alive(p) for p in pids):
+        while time.time() < deadline and any(alive(p) for p in pids):
             time.sleep(0.2)
-        self.assertFalse([p for p in pids if _alive(p)],
+        self.assertFalse([p for p in pids if alive(p)],
                          "sessions outlived the daemon that owned their stdin")
 
     def test_reap_strays_kills_a_session_a_dead_daemon_left_behind(self):
@@ -428,17 +420,9 @@ class ConcurrentAgentTests(unittest.TestCase):
         procs = [subprocess.Popen([CLI, "check", "P.v"], cwd=self.a.dir,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                  for _ in range(8)]
-        codes = []
-        for p in procs:
-            _out, err = p.communicate(timeout=300)
-            codes.append(p.returncode)
-            # One check per file, so a client that collides is refused; what
-            # is under test is how many daemons they started between them.
-            if p.returncode == 2:
-                self.assertIn(b"already being checked", err)
-            else:
-                self.assertEqual(p.returncode, 0, err)
-        self.assertIn(0, codes, codes)
+        # A client that collides is refused; what is under test here is how
+        # many daemons they started between them.
+        _verdict_or_busy(self, procs)
         time.sleep(1.0)
         self.assertEqual(_daemons_for(self.a.dir), 1,
                          "expected exactly one daemon serving the tree")
@@ -477,7 +461,7 @@ class BudgetTests(unittest.TestCase):
 
     def test_a_session_ceiling_leaves_room_for_a_real_proof(self):
         budget = server._budget_bytes()
-        self.assertGreater(server._session_ceiling(budget, 4), 4e9,
+        self.assertGreater(server._session_ceiling(budget), 4e9,
                            "a ceiling this tight would kill legitimate proofs")
 
     def test_pressure_is_read_from_the_machine_not_from_us(self):
@@ -485,6 +469,25 @@ class BudgetTests(unittest.TestCase):
         self.assertIsNotNone(avail, "MemAvailable should be readable on Linux")
         self.assertGreater(avail, 0)
         self.assertGreater(server._min_free_bytes(), 0)
+
+
+def _verdict_or_busy(case, procs, timeout=300):
+    """Exit codes of racing clients, each insisted on being defensible.
+
+    One check per file at a time, so a client that collides is refused at exit
+    2 and must say why; anything else has to be a clean verdict.  One of them
+    must have won, or the race proved nothing.
+    """
+    codes = []
+    for proc in procs:
+        _out, err = proc.communicate(timeout=timeout)
+        codes.append(proc.returncode)
+        if proc.returncode == 2:
+            case.assertIn(b"already being checked", err)
+        else:
+            case.assertEqual(proc.returncode, 0, err)
+    case.assertIn(0, codes, codes)
+    return codes
 
 
 def _daemons_for(root):
@@ -508,14 +511,6 @@ def _reap(proc):
     if proc.poll() is None:
         proc.kill()
     proc.wait()
-
-
-def _alive(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
 
 
 if __name__ == "__main__":

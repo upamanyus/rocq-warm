@@ -253,10 +253,18 @@ One table maps each file to a **slot**, which either holds that file's session
 or records that a check has borrowed it. A borrower gets the session that
 exists or starts the one that does not; a second check of the same file finds
 the slot borrowed and is refused rather than queued. So a session needs no
-lock of its own, because a borrowed one has exactly one user, and nothing in
-the daemon ever waits on another thread — which leaves no lock ordering to
-establish and no hang to reason about. The one lock there is guards the table,
-does nothing else, and is never held across anything that blocks.
+lock of its own, because a borrowed one has exactly one user, and no thread
+ever waits on another thread's borrow — which leaves no lock ordering to
+establish between checks. The one lock there is guards the session table and
+the graph registry beside it, and is never held across anything that blocks.
+
+The waiting the daemon does do is on compiles, not on borrows: `_stale` and
+`_rebuild` block on the compiler's condition variable, always with the check's
+own deadline, because a `.vo` whose build is already running is a reason to
+wait rather than to refuse. That is the deliberate exception, and it is why
+`report_wedged` exists — a borrow held long past its deadline is not something
+the design rules out, it is something the daemon logs so the file's refusals
+can be traced back to the check still holding it.
 
 A slot never leaves the table, so every child that exists is reachable from it
 at every instant: there is no move for one to be lost in. What the slot keeps

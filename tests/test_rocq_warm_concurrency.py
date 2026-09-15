@@ -19,7 +19,7 @@ import threading
 import time
 import unittest
 
-from rocq_warm_helpers import Workspace, requires_rocq_repl, wait_for
+from rocq_warm_helpers import Workspace, alive, requires_rocq_repl, wait_for
 from rocqwarm import server as server_mod
 from rocqwarm import session as session_mod
 
@@ -27,15 +27,6 @@ from rocqwarm import session as session_mod
 # keys off a predicate, so a slower machine only widens the window it needs.
 SPIN = b"Lemma spin : True.\nProof. do 80000000 idtac. exact I. Qed.\n"
 QUICK = b"Lemma quick : True.\nProof. exact I. Qed.\n"
-
-
-def alive(pid):
-    """Is `pid` a live process -- as opposed to gone, or an unreaped zombie?"""
-    try:
-        with open("/proc/%d/stat" % pid) as f:
-            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
-    except OSError:
-        return False
 
 
 class TrackingLock:
@@ -126,6 +117,30 @@ class ServerCase(unittest.TestCase):
             target=lambda: out.update(result=self.check(**kw)), daemon=True)
         t.start()
         return t, out
+
+    def race(self, **paths):
+        """Check several files at the same instant; returns {name: response}.
+
+        A barrier rather than a sleep, so the collision is the test's doing
+        and not the scheduler's.  A thread that raised leaves its name out of
+        the result, which is caught here rather than surfacing later as a
+        `KeyError` in the assertions.
+        """
+        bar, out = threading.Barrier(len(paths)), {}
+
+        def go(name, path):
+            bar.wait()
+            out[name] = self.check(path=path)
+
+        threads = [threading.Thread(target=go, args=(n, p))
+                   for n, p in paths.items()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=300)
+        self.assertEqual(sorted(out), sorted(paths),
+                         "a racing check never returned: %r" % (out,))
+        return out
 
     def wait_until_checking(self):
         """Block until a check of self.path has borrowed it and has a rocq."""
@@ -246,18 +261,7 @@ class ConcurrentCheckTests(ServerCase):
         help from the test.  Exactly one gets a verdict; the other is told the
         file is busy, promptly, and nothing is left running behind either.
         """
-        bar, out = threading.Barrier(2), {}
-
-        def go(name):
-            bar.wait()
-            out[name] = self.check()
-
-        threads = [threading.Thread(target=go, args=(n,)) for n in ("A", "B")]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=300)
-
+        out = self.race(A=self.path, B=self.path)
         verdicts = [r for r in out.values() if r.get("ok")]
         refusals = [r for r in out.values() if not r.get("ok")]
         self.assertEqual(len(verdicts), 1, out)
@@ -411,18 +415,21 @@ class BookkeepingTests(ServerCase):
         self.assertEqual(len(self.recorded_pids()), 2)
 
     def test_the_staleness_check_is_not_under_the_table_lock(self):
-        """`loaded_changed` stats every .vo the session holds.
+        """Deciding whether a session still matches its libraries reads disk.
 
-        Under the session table's lock that is every other file's check
-        waiting behind a few hundred `stat` calls, which is the opposite of
-        what a daemon serving several files at once is for.
+        The check fingerprints the closure and the session's own `.vo` set
+        together and `loaded_changed` compares against that, so the `stat`
+        sweep happens once -- but either of them under the session table's
+        lock would be every other file's check waiting behind a few hundred
+        `stat` calls, which is the opposite of what a daemon serving several
+        files at once is for.
         """
         seen = []
         real = session_mod.Session.loaded_changed
 
-        def watched(sess):
+        def watched(sess, known=None):
             seen.append(self.srv.lock.held_by_me())
-            return real(sess)
+            return real(sess, known=known)
 
         self.assertTrue(self.check().get("passed"))     # populates `loaded`
         session_mod.Session.loaded_changed = watched
@@ -451,19 +458,7 @@ class EvictionTests(ServerCase):
         once than session slots.
         """
         other = self.ws.write("D.v", QUICK)
-        bar, out = threading.Barrier(2), {}
-
-        def go(name, path):
-            bar.wait()
-            out[name] = self.check(path=path)
-
-        threads = [threading.Thread(target=go, args=(n, p)) for n, p in
-                   (("C", self.path), ("D", other))]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=300)
-
+        out = self.race(C=self.path, D=other)
         for name, res in out.items():
             self.assertTrue(res.get("passed"), "%s: %r" % (name, res))
         # The budget is one, so at most one session survives -- and whatever

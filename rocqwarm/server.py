@@ -17,9 +17,12 @@ are evicted LRU under a memory budget, and idle ones time out.
 borrowed by a running check, giving at most one `rocq repl` per file and one
 check of it at a time.  A borrower takes the session that exists or starts the
 one that does not; a second check of the same file is refused rather than
-queued.  So a session needs no lock, and nothing here waits on another thread.
+queued.  So a session needs no lock, and no thread ever waits on another
+thread's borrow.  Compiles are waited for, deliberately and with a deadline;
+the session table is not.
 """
 
+import contextlib
 import fcntl
 import json
 import os
@@ -82,13 +85,26 @@ def _min_free_bytes():
     return max(DEFAULT_MIN_FREE, _total_bytes() * 0.05)
 
 
-def _session_ceiling(budget, max_sessions):
+def _session_ceiling(budget):
     env = os.environ.get("ROCQ_WARM_MAX_SESSION_GB")
     if env:
         return float(env) * 1e9
-    # Half the budget, not budget/max_sessions: one big proof legitimately
+    # Half the budget, not a share per session: one big proof legitimately
     # costs several GB, and a ceiling that kills it is worse than none.
     return budget / 2.0
+
+
+def _toolchain_env(toolchain):
+    """The `rocq` to run and the environment to run it in, from one tuple.
+
+    Module-level so a `Slot` can decode the toolchain it was handed instead of
+    being passed the decoding alongside it.
+    """
+    rocq, env_items = (toolchain or (None, ()))
+    # MERGE, never replace: `env=` is the child's whole environment, and one
+    # without HOME or TMPDIR misbehaves for non-Rocq reasons.
+    env = dict(os.environ, **dict(env_items)) if env_items else None
+    return rocq or "rocq", env
 
 
 class Slot:
@@ -112,24 +128,30 @@ class Slot:
         self.since = None           # when the borrow started
         self.deadline = None        # ... and what it promised to finish by
 
-    def ready(self, flags, cwd, toolchain, rocq, env, rss_limit, cold):
+    def ready(self, flags, cwd, toolchain, rss_limit, loaded):
         """The session to check with, started and answering for THIS build.
 
-        Discards and respawns when the flags or toolchain differ from the ones
-        the session was spawned for, when a `.vo` it loaded has changed, or on
-        `--cold`.  The caller owns the slot, so each of those is a field
-        assignment rather than a table mutation.
+        Discards and respawns when the child is dead, when the flags or
+        toolchain differ from the ones the session was spawned for, or when a
+        `.vo` it loaded has changed.  The caller owns the slot, so each of
+        those is a field assignment rather than a table mutation.
+
+        `loaded` is the fingerprint the caller already took, covering at least
+        this session's `.vo` set; passing it keeps the check to one stat per
+        library instead of two.  `rocq` and `env` are derived from `toolchain`
+        here rather than passed beside it, so the two cannot disagree.
         """
-        if self.sess is not None and not self.sess.alive:
-            self.discard()          # a dead child holds nothing worth keeping
-        # Only when there IS a session: otherwise `loaded_changed()` would
-        # stat the `.vo` set of a session that no longer exists.
-        if self.sess is not None:
-            if (flags, toolchain) != (self.sess.flags, self.sess.toolchain):
-                self.discard()
-            elif cold or self.sess.loaded_changed():
-                self.discard()
+        # Short-circuiting in order: a dead or mis-flagged session is never
+        # asked what it loaded, which would mean stat'ing for a child that is
+        # about to be thrown away.
+        if self.sess is not None and (
+                not self.sess.alive
+                or (flags, toolchain) != (self.sess.flags,
+                                          self.sess.toolchain)
+                or self.sess.loaded_changed(known=loaded)):
+            self.discard()
         if self.sess is None:
+            rocq, env = _toolchain_env(toolchain)
             self.sess = session_mod.Session(
                 self.path, flags, cwd=cwd, rocq=rocq, env=env,
                 rss_limit=rss_limit, toolchain=toolchain)
@@ -168,21 +190,13 @@ class Server:
 
     # -------------------------------------------------------------- sessions
 
-    @staticmethod
-    def _toolchain_env(toolchain):
-        rocq, env_items = (toolchain or (None, ()))
-        # MERGE, never replace: `env=` is the child's whole environment, and
-        # one without HOME or TMPDIR misbehaves for non-Rocq reasons.
-        env = dict(os.environ, **dict(env_items)) if env_items else None
-        return rocq or "rocq", env
-
     def _graph(self, flags, cwd, toolchain):
         """The dependency graph for one project, shared by its sessions."""
         key = (cwd, tuple(flags), toolchain)
         with self.lock:
             g = self.graphs.get(key)
         if g is None:
-            rocq, env = self._toolchain_env(toolchain)
+            rocq, env = _toolchain_env(toolchain)
             g = project.DepGraph(flags, cwd, project.find_project(cwd),
                                  rocq=rocq, env=env)
             with self.lock:
@@ -216,8 +230,31 @@ class Server:
             slot.since = slot.deadline = None
             slot.last_used = time.time()
 
-    def _live_sessions(self):
-        """(slot, session) for every slot that has one.
+    @contextlib.contextmanager
+    def _borrowed(self, path, deadline=None):
+        """`_borrow` and `_give_back` as one block; yields the slot or None.
+
+        A slot never given back refuses its file for the daemon's life, so
+        handing it back belongs here rather than to a `finally` each caller
+        writes for itself.  Recording the pids comes with it: a borrower is
+        the only thing that starts or stops a child, so a borrow ending is
+        exactly when the pid file can have gone out of date.
+        """
+        slot = self._borrow(path, deadline=deadline)
+        try:
+            yield slot
+        finally:
+            if slot is not None:
+                self._give_back(slot)
+                self._record_sessions()
+
+    def _census(self):
+        """One snapshot of the table: (live (slot, session) pairs, starting).
+
+        `starting` counts borrowed slots with no session yet -- a cold start
+        in progress, which costs memory the budget has to know about.  Both
+        come from one walk, so a count and the candidates it is compared
+        against cannot be from two different instants.
 
         `slot.sess` is read once per slot, so that a borrower discarding it
         cannot make a test and a use of it disagree.  Reading is all a
@@ -225,12 +262,18 @@ class Server:
         """
         with self.lock:
             slots = list(self.sessions.values())
-        out = []
+        live, starting = [], 0
         for slot in slots:
             sess = slot.sess
             if sess is not None:
-                out.append((slot, sess))
-        return out
+                live.append((slot, sess))
+            elif slot.borrowed:
+                starting += 1
+        return live, starting
+
+    def _live_sessions(self):
+        """(slot, session) for every slot that has one."""
+        return self._census()[0]
 
     # ------------------------------------------------------- stray children
 
@@ -245,9 +288,8 @@ class Server:
         """
         try:
             rows = ["%d\t%s" % (pid, slot.path)
-                    for slot, pid in ((s, sess.live_pid())
-                                      for s, sess in self._live_sessions())
-                    if pid is not None]
+                    for slot, sess in self._live_sessions()
+                    if (pid := sess.live_pid()) is not None]
             tmp = self.pids_path + ".tmp"
             with open(tmp, "w") as f:
                 f.write("\n".join(rows) + ("\n" if rows else ""))
@@ -298,15 +340,12 @@ class Server:
         yet, a cold start in progress.
         """
         while True:
-            live = self._live_sessions()
+            live, starting = self._census()
             free = sorted((s for s, _sess in live if not s.borrowed),
                           key=lambda s: s.last_used)
-            with self.lock:
-                starting = sum(1 for s in self.sessions.values()
-                               if s.borrowed and s.sess is None)
-            held = len(live) + starting
             if not free:
                 return                  # everything we hold is mid-check
+            held = len(live) + starting
             used = sum(sess.rss_bytes() for _s, sess in live)
             avail = _available_bytes()
             pressure = avail is not None and avail < self.min_free
@@ -326,15 +365,11 @@ class Server:
         the file while its Rocq is being killed.  False if another caller
         holds it.
         """
-        slot = self._borrow(path)
-        if slot is None:
-            return False
-        try:
+        with self._borrowed(path) as slot:
+            if slot is None:
+                return False
             slot.discard()
-        finally:
-            self._give_back(slot)
-        self._record_sessions()
-        return True
+            return True
 
     def reap_idle(self):
         now = time.time()
@@ -404,7 +439,7 @@ class Server:
         timeout = float(req.get("timeout") or DEFAULT_CHECK_TIMEOUT)
         toolchain = (req.get("rocq"),
                      tuple(sorted((req.get("env") or {}).items())))
-        rocq, env = self._toolchain_env(toolchain)
+        rocq, env = _toolchain_env(toolchain)
         flags, cwd = project.flags_for(path)
 
         # What this text loads, from its Require lines as they are NOW.
@@ -437,23 +472,22 @@ class Server:
 
         # One check per file at a time.  Refused rather than queued: what a
         # waiter would wait on is a proof, so no deadline would be honest.
-        slot = self._borrow(path, deadline=t0 + timeout)
-        if slot is None:
-            return self._busy_refusal(path)
-        try:
+        with self._borrowed(path, deadline=t0 + timeout) as slot:
+            if slot is None:
+                return self._busy_refusal(path)
             # Before spawning: this slot is borrowed so eviction cannot pick
             # it, and the session it will hold already counts.
             self._evict()
+            if req.get("cold"):
+                slot.discard()      # --cold: whatever is parked is not wanted
             # Stat'ed before the session loads anything: a `.vo` rebuilt mid
             # check must not be recorded as though that were what it loaded.
             parked = slot.sess
             watched = sorted(set(closure)
                              | set(parked.loaded if parked else ()))
             pre = {p: (m, sz) for p, m, sz in project.fingerprint(watched)}
-            sess = slot.ready(
-                flags, cwd, toolchain, rocq, env,
-                _session_ceiling(self.budget, self.max_sessions),
-                cold=bool(req.get("cold")))
+            sess = slot.ready(flags, cwd, toolchain,
+                              _session_ceiling(self.budget), pre)
             self._record_sessions()     # there is a pid now, and not before
             try:
                 result = sess.check(text, timeout=timeout)
@@ -490,10 +524,6 @@ class Server:
                 slot.discard()
             else:
                 sess.loaded = {p: pre.get(p, post[p]) for p in post}
-        finally:
-            # A slot never given back refuses its file for the daemon's life.
-            self._give_back(slot)
-            self._record_sessions()
         # Checkable again from here: `--compile` runs a real `rocq compile`
         # for minutes and touches no session, so it is outside the borrow.
         compile_mod.log("check: %s %s [%s, %d sentences, %.1fs]%s", path,
@@ -518,7 +548,7 @@ class Server:
             "rss": rss,
             "stale": stale_rows,            # only when allow_stale let it through
             "note": note,
-            "vo": _describe_job(job) if job is not None else None,
+            "vo": _describe_job(job),
             # Why make would rebuild THIS file's .vo now; after a green check
             # that is "its source is newer".
             "vo_stale": project.staleness(project.vo_of(path), graph.graph),
@@ -526,7 +556,7 @@ class Server:
             "digest": digest,
             # Resolved against the text checked, so nothing re-reads the file.
             "diags": [{"kind": d.kind,
-                       "at": diag.line_col(text, d.span(text)),
+                       "at": diag.line_col(text, d.span()),
                        "message": d.message().decode("utf8", "replace")}
                       for d in result.diags],
         }
@@ -541,15 +571,13 @@ class Server:
         with self.lock:
             slot = self.sessions.get(path)
             since = slot.since if slot is not None and slot.borrowed else None
-        row = {"path": path, "since": since,
-               "seconds": None if since is None else time.time() - since}
-        # Can be missing: the slot may have been given back since the borrow
-        # failed.
-        detail = ("" if row["seconds"] is None
-                  else ", running for %.0fs" % row["seconds"])
-        return {"ok": False, "busy": row,
+        # None when the slot was given back between the failed borrow and
+        # this read; `report` renders the duration when there is one.
+        return {"ok": False,
+                "busy": {"seconds": None if since is None
+                         else time.time() - since},
                 "error": "one check per file at a time, and this file is "
-                         "already being checked%s" % detail}
+                         "already being checked"}
 
     # ------------------------------------------------------------ staleness
 
@@ -627,9 +655,9 @@ class Server:
                 "complete": sess.complete,
                 "rss": sess.rss_bytes(),
                 # Time since the slot was given back, which is not idleness
-                # for a session being checked -- hence `busy`.
+                # for a session being checked -- hence `busy_for`, which is
+                # set exactly when this one is meaningless.
                 "idle": now - slot.last_used,
-                "busy": slot.borrowed,
                 "busy_for": None if since is None else now - since,
                 "watched": len(sess.loaded),
             })

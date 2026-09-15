@@ -115,7 +115,7 @@ def status(resp):
     for s in resp["sessions"]:
         # "idle 4s" would read as the opposite of the truth for a session
         # being checked, so a busy one says so instead.
-        when = ("busy %4.0fs" % s["busy_for"] if s["busy"]
+        when = ("busy %4.0fs" % s["busy_for"] if s["busy_for"] is not None
                 else "idle %4.0fs" % s["idle"])
         out += ("  %-60s %s %4d sentences  %5.1f GB  %s  %4d .vo watched  "
                 "pid %s\n"

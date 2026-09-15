@@ -163,13 +163,21 @@ class Session:
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def loaded_changed(self):
+    def loaded_changed(self, known=None):
         """Has any .vo this session holds been rebuilt, removed or replaced?
 
         A session that answers true is discarded rather than left answering
         for a library that no longer matches its source.  A missing file
         fingerprints as `(None, None)`, so deletion and rebuild compare alike.
+
+        `known` is a fingerprint the caller has already taken, which must
+        cover every path in `loaded`; a check takes one for the closure and
+        this set together, and reusing it saves stat'ing a few hundred
+        libraries a second time.  A path missing from it is a bug, and raises
+        rather than being read as unchanged.
         """
+        if known is not None:
+            return any(self.loaded[p] != known[p] for p in self.loaded)
         now = project.fingerprint(sorted(self.loaded))
         return any(self.loaded[p] != (m, sz) for p, m, sz in now)
 
@@ -759,12 +767,10 @@ class Session:
 
         self.text_being_fed = text
         items = self._absorb(items, base, resume, len(text))
-        first_bad = None
-        for i, it in enumerate(items):
-            if it.failed:
-                first_bad = i
-                break
-        good = items[:first_bad] if first_bad is not None else items
+        first_bad = next((i for i, it in enumerate(items) if it.failed), None)
+        # A `None` stop slices to the end, which is exactly what "nothing
+        # failed, so keep all of it" means.
+        good = items[:first_bad]
         # The reused prefix's warnings, which a warm run never re-executes:
         # without them a replay drops every warning above the edit and stops
         # matching `coqc`.
@@ -906,8 +912,9 @@ def _split_messages(raw):
 class Diag:
     """One error or warning, still carrying Rocq's raw blob.
 
-    The absolute span is not stored, since it depends on the file text that
-    the caller holds.
+    The span is derived rather than stored: it is the anchor plus the offsets
+    in the blob, which is what `locate` does.  Turning it into a line and
+    column needs the file text, which only the caller holds.
     """
 
     __slots__ = ("kind", "anchor", "raw")
@@ -915,14 +922,14 @@ class Diag:
     def __init__(self, kind, anchor, raw):
         self.kind, self.anchor, self.raw = kind, anchor, raw
 
-    def span(self, text):
+    def span(self):
         return diagmod.locate(self.raw, self.anchor)
 
     def message(self):
         return diagmod.strip_location(self.raw)
 
     def render(self, display_path, text):
-        return diagmod.render(display_path, text, self.span(text),
+        return diagmod.render(display_path, text, self.span(),
                               self.message())
 
     def __repr__(self):

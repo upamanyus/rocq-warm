@@ -112,6 +112,15 @@ def request(root, msg, spawn=True):
         sock.close()
 
 
+def _emit(resp, as_json):
+    """The one output decision left on this side: structured, or the daemon's
+    own rendering of it."""
+    if as_json:
+        print(json.dumps(resp, indent=2))
+    else:
+        sys.stdout.write(resp.get("out", ""))
+
+
 def cmd_check(args):
     """Ask the daemon, print what it says, exit with the code it gives."""
     path = os.path.abspath(args.file)
@@ -128,10 +137,7 @@ def cmd_check(args):
     if resp is None:
         sys.stderr.write("rocq-warm: no response\n")
         return 2
-    if args.json:
-        print(json.dumps(resp, indent=2))
-    else:
-        sys.stdout.write(resp.get("out", ""))
+    _emit(resp, args.json)
     # The fallbacks cover a daemon that failed before it could render, and so
     # answered with an error and nothing else.
     sys.stderr.write(resp.get("log")
@@ -145,10 +151,7 @@ def cmd_status(args):
     resp = request(root, {"cmd": "status"}, spawn=False) or {
         "ok": False, "error": "no daemon running", "root": root,
         "out": "rocq-warm: no daemon running for %s\n" % root}
-    if args.json:
-        print(json.dumps(resp, indent=2))
-    else:
-        sys.stdout.write(resp.get("out", ""))
+    _emit(resp, args.json)
     return 0
 
 

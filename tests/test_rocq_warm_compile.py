@@ -11,7 +11,7 @@ import subprocess
 import time
 import unittest
 
-from rocq_warm_helpers import Workspace, requires_rocq, wait_for
+from rocq_warm_helpers import Workspace, alive, requires_rocq, wait_for
 from rocqwarm import compile as compile_mod
 
 # Sized so the compile runs several seconds even on a slow, shared CI core,
@@ -171,21 +171,9 @@ class CompilerTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda: job.proc is not None, timeout=30))
         pid = job.proc.pid
         self.comp.stop()
-        self.assertTrue(wait_for(lambda: not _alive(pid), timeout=10),
+        self.assertTrue(wait_for(lambda: not alive(pid), timeout=10),
                         "the compile outlived the compiler")
         self.assertEqual(job.state, "cancelled")
-
-
-def _alive(pid):
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    try:
-        with open("/proc/%d/stat" % pid) as f:
-            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
-    except OSError:
-        return False
 
 
 if __name__ == "__main__":
