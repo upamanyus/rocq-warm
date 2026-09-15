@@ -10,9 +10,8 @@ outlives the shell that started it and the next caller may be in another opam
 switch.  How a check reads -- diagnostics in `coqc`'s format, the warnings,
 the verdict line, the exit code -- is the daemon's, in `report`.
 
-Exit codes: 0 the file checks, 1 it does not, 2 it could not be checked (a
-stale dependency, the file is already being checked, no daemon, no rocq), 3 a
-green verdict that a real `rocq compile` then rejects.
+The exit codes are `CHECK_EPILOG` below, which is also what `check --help`
+prints; `report` is where they are decided.
 """
 
 import argparse
@@ -162,6 +161,25 @@ def cmd_stop(args):
     return 0
 
 
+# On `check --help`, because the exit code is the whole interface for anything
+# calling this from a script rather than reading it.  Spelling out that 2 is
+# not a verdict is the point: read as 1 it reports a broken proof where there
+# was only a dependency to rebuild.
+CHECK_EPILOG = """\
+exit codes:
+  0  the file checks
+  1  it does not -- a verdict about the proof
+  2  it could NOT be checked, which is not a verdict about the proof: a
+     stale dependency, the file is already being checked, no daemon, no rocq
+  3  a green verdict that a real `rocq compile` then rejected -- a bug in
+     rocq-warm, please report it
+
+A plain check writes no .vo -- this is an edit-loop tool, not a build tool --
+so anything that requires this file still reads the library from before the
+edit.  Pass --compile to write it, or run make.
+"""
+
+
 def main(argv=None):
     if shutil.which("rocq") is None:
         raise SystemExit("rocq-warm: no `rocq` on PATH -- "
@@ -169,7 +187,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="rocq-warm")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    c = sub.add_parser("check", help="check a .v file, reusing a warm session")
+    c = sub.add_parser("check", help="check a .v file, reusing a warm session",
+                       epilog=CHECK_EPILOG,
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
     c.add_argument("file")
     c.add_argument("--cold", action="store_true",
                    help="discard any warm session first")
