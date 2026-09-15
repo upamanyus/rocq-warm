@@ -1,19 +1,11 @@
-"""Resolving a .v file's build flags, its dependency graph, and what is stale.
+"""A .v file's build flags, its dependency graph, and what is stale.
 
-Three jobs, all about making sure a warm session is checking the same thing a
-cold `coqc` would:
-
-* turn the nearest `_CoqProject` into the flag list `rocq repl` needs, so the
-  session sees exactly the load path and warning settings the build uses;
-* keep the project's `.vo` dependency graph current, so that the transitive
-  closure a file loads is known before the session starts and re-known after
-  every edit -- adding a `Require` mid-session must not create a dependency
-  nobody is watching;
-* decide which of those `.vo` files `make` would rebuild.  A `.vo` that is
-  older than its `.v`, or older than a `.vo` it depends on, is a library that
-  no longer matches its source, and checking a proof against it produces
-  verdicts about a program that does not exist.  Make's rule is the one the
-  build system already applies, so it is the one used here, verbatim.
+The nearest `_CoqProject` gives the flags, so the session gets the load path
+the build uses.  The `.vo` graph is kept current, so a `Require` added
+mid-session does not leave a dependency unwatched.  `make`'s rule decides
+what is stale: a `.vo` older than its `.v`, or than a `.vo` it requires, no
+longer matches its source, and a proof checked against it gets verdicts about
+a program that does not exist.
 """
 
 import os
@@ -41,8 +33,8 @@ def find_project(start):
 def parse_project(path):
     """Flags from a _CoqProject, in the order `rocq` wants them.
 
-    Only the load-path and `-arg` directives matter to us; the listed `.v`
-    files are the build's business, not ours.
+    Only load-path and `-arg` directives; the listed `.v` files are the
+    build's business.
     """
     flags = []
     with open(path) as f:
@@ -67,7 +59,7 @@ def parse_project(path):
                     flags.append(tok)
                     i += 1
                 else:
-                    i += 1              # a source file; not our business
+                    i += 1              # a source file, not a flag
     return flags
 
 
@@ -95,12 +87,10 @@ def load_roots(flags, cwd):
 def project_sources(project_path, cwd, flags=None):
     """The .v files a _CoqProject lists, plus every .v under its -R/-Q roots.
 
-    Both, not either: a `_CoqProject` lists the files ITS build compiles, but
-    `-R ../model Riscv` makes a whole other tree loadable, and a `.vo` in
-    there has dependencies of its own that a session loads just the same.
-    Without walking the roots those files appear in the graph only as edges,
-    never as nodes, so nothing beneath them is ever watched.  Relative to
-    `cwd`, listed files first, then the rest sorted.
+    Both, not either: `-R ../model Riscv` makes another tree loadable, and
+    unwalked its files appear in the graph as edges but never as nodes, so
+    nothing beneath them is watched.  Listed files first, then the rest
+    sorted, all relative to `cwd`.
     """
     files = []
     seen = set()
@@ -131,12 +121,11 @@ def project_sources(project_path, cwd, flags=None):
 
 
 def _run_dep(flags, cwd, sources, timeout, rocq, env):
-    """{target.vo: [dep.vo, ...]} from one `rocq dep` run, or None if it
-    could not be run at all.
+    """{target.vo: [dep.vo]} from one `rocq dep` run, or None if it could not
+    be run.
 
-    `rocq dep` exits without printing ANYTHING when one of the files it is
-    handed does not exist, so callers must only hand it files that do -- a
-    `_CoqProject` routinely lists generated files that are not there yet.
+    `rocq dep` prints NOTHING AT ALL if any file it is handed is missing, so
+    callers filter first: a `_CoqProject` routinely lists generated files.
     """
     if not sources:
         return {}
@@ -161,17 +150,6 @@ def _run_dep(flags, cwd, sources, timeout, rocq, env):
     return graph
 
 
-def dep_graph(flags, cwd, sources, timeout=300, rocq="rocq", env=None):
-    """{target.vo: [dep.vo, ...]} for a whole project, in one `rocq dep` run.
-
-    One call over ~1300 files costs about 1.5s.  Files that do not exist are
-    left out rather than handed to `rocq dep`, which would otherwise refuse
-    the whole batch.
-    """
-    present = [s for s in sources if os.path.isfile(os.path.join(cwd, s))]
-    return _run_dep(flags, cwd, present, timeout, rocq, env) or {}
-
-
 def vo_of(v_path):
     return v_path[:-2] + ".vo"
 
@@ -183,13 +161,10 @@ def v_of(vo_path):
 class DepGraph:
     """A project's `.vo` dependency graph, kept current between checks.
 
-    A full `rocq dep` over a large tree costs a second or two, which is fine
-    once and not fine on every edit.  So the graph is refreshed incrementally:
-    every source is stat'ed on each refresh (a few milliseconds for a thousand
-    files) and only the ones whose mtime moved are re-run through `rocq dep`.
-    The file being edited is always among them, which is the point: the
-    `Require` lines at the top of a file are edited like anything else, and the
-    closure has to follow.
+    A full `rocq dep` over a large tree costs a second or two, too slow per
+    edit, so refreshes are incremental: every source is stat'ed and only those
+    whose mtime moved are re-run.  The file being checked is always among
+    them, so editing its `Require` lines moves the closure.
     """
 
     def __init__(self, flags, cwd, project_path=None, rocq="rocq", env=None,
@@ -201,17 +176,17 @@ class DepGraph:
         self.graph = {}         # vo -> [vo]
         self.stamps = {}        # abs .v -> mtime_ns
         self.refreshes = 0      # how many `rocq dep` runs, for the tests
-        # One DepGraph is shared by every session in a project, and several
-        # clients can check different files in it at the same instant, so the
-        # mutation in `refresh` and the reads in `closure`/`direct` are locked.
+        # One DepGraph is shared by every session in a project, and clients
+        # can check different files in it at the same instant, so `refresh`'s
+        # mutation and `closure`'s reads are locked.
         self._lock = threading.Lock()
 
     def refresh(self, extra=()):
-        """Bring the graph up to date; returns the number of files re-scanned.
+        """Bring the graph up to date; returns how many files were re-scanned.
 
-        `extra` names .v files to include even if no root or listing covers
-        them -- the file being checked is always one, so that a file outside
-        the project still gets its own dependencies looked up.
+        `extra` names .v files no root or listing covers.  The file being
+        checked is always one, so a file outside the project still gets its
+        dependencies looked up.
         """
         with self._lock:
             return self._refresh_locked(extra)
@@ -255,11 +230,6 @@ class DepGraph:
                     self.graph.pop(vo, None)
         return len(present)
 
-    def direct(self, path):
-        """The .vo files `path` requires directly, or None if unknown."""
-        with self._lock:
-            return self.graph.get(vo_of(os.path.abspath(path)))
-
     def closure(self, path):
         """Every .vo `path` transitively loads, absolute and sorted."""
         seed = vo_of(os.path.abspath(path))
@@ -267,17 +237,16 @@ class DepGraph:
             direct = self.graph.get(seed)
             if direct is not None:
                 return self._walk_locked(direct)
-        # Not in the graph -- a file outside the project.  Ask `rocq dep`
-        # for its direct requires WITHOUT the lock (it is a subprocess), then
-        # walk the shared graph under the lock again.
+        # Not in the graph, so a file outside the project.  `rocq dep` is a
+        # subprocess and runs without the lock; the walk retakes it.
         direct = _direct_deps(path, self.flags, self.cwd,
                               rocq=self.rocq, env=self.env) or []
         with self._lock:
             return self._walk_locked(direct)
 
     def _walk_locked(self, direct):
-        """The transitive closure of `direct` through the graph.  Caller holds
-        the lock; every read of self.graph happens under it."""
+        """`direct` closed over the graph.  Caller holds the lock, which every
+        read of self.graph is under."""
         seen, queue = set(), list(direct)
         while queue:
             d = queue.pop()
@@ -286,25 +255,6 @@ class DepGraph:
             seen.add(d)
             queue.extend(self.graph.get(d, ()))
         return sorted(seen)
-
-
-def closure(path, flags, cwd, graph, rocq="rocq", env=None):
-    """Every .vo the file transitively needs, absolute and sorted."""
-    rel = os.path.relpath(os.path.abspath(path), cwd)
-    seed = os.path.normpath(os.path.join(cwd, rel[:-2] + ".vo"))
-    direct = graph.get(seed)
-    if direct is None:
-        direct = _direct_deps(path, flags, cwd, rocq=rocq, env=env)
-        if direct is None:
-            return None
-    seen, queue = set(), list(direct)
-    while queue:
-        d = queue.pop()
-        if d in seen:
-            continue
-        seen.add(d)
-        queue.extend(graph.get(d, ()))
-    return sorted(seen)
 
 
 def _direct_deps(path, flags, cwd, timeout=120, rocq="rocq", env=None):
@@ -328,8 +278,8 @@ def _direct_deps(path, flags, cwd, timeout=120, rocq="rocq", env=None):
 def fingerprint(deps):
     """(path, mtime_ns, size) per dependency; missing files get None fields.
 
-    Compared verbatim on the next check: any difference means a dependency was
-    rebuilt and the warm session is holding a stale library.
+    Compared verbatim next check: any difference means a rebuild, so the
+    session holds a stale library.
     """
     out = []
     for d in deps or ():
@@ -351,10 +301,9 @@ def _mtime(path):
 def staleness(vo, graph):
     """Why `make` would rebuild `vo`, or None if it would not.
 
-    Make's rule, verbatim: a target is rebuilt when it is missing or older
-    than any prerequisite.  The prerequisites of a `.vo` are its `.v` and the
-    `.vo` files it requires.  Equal mtimes are up to date, as they are for
-    make -- a build that sets the output's mtime to the source's is fine.
+    Make's rule verbatim: rebuilt when missing or older than a prerequisite,
+    a `.vo`'s being its `.v` and the `.vo` files it requires.  Equal mtimes
+    count as current, as for make.
     """
     vo_m = _mtime(vo)
     v = v_of(vo)
@@ -383,11 +332,11 @@ def stale_deps(closure, graph):
 
 
 def rebuild_plan(closure, stale, graph):
-    """The .vo files to rebuild, in an order that respects their dependencies.
+    """The .vo files to rebuild, in dependency order.
 
-    Everything stale, plus everything in the closure that depends on
-    something stale: once `Base.vo` is rebuilt, `Mid.vo` is older than it and
-    make would rebuild that too.  Each entry is (vo, [vo it must wait for]).
+    Everything stale, plus every closure member depending on something stale:
+    rebuilding `Base.vo` leaves `Mid.vo` older than it.  Each entry is
+    (vo, [vo it must wait for]).
     """
     members = set(closure)
     dependents = {}

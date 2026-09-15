@@ -25,14 +25,19 @@ class LocationTests(unittest.TestCase):
         self.ws = Workspace()
         self.addCleanup(self.ws.cleanup)
 
-    def assertSameAsCoqc(self, text, label):
+    def warm_and_cold(self, text):
+        """(rocq-warm's diagnostics, `coqc`'s whole output) for one file."""
         path = self.ws.write(self.NAME, text)
         sess = session_mod.Session(path, self.ws.flags, cwd=self.ws.dir)
         sess.start()
         self.addCleanup(sess.stop)
         result = sess.check(text, timeout=300)
         _rc, cold = self.ws.coqc(self.NAME)
-        self.assertEqual(render_all(result, self.NAME, text), cold, label)
+        return render_all(result, self.NAME, text), cold
+
+    def assertSameAsCoqc(self, text, label):
+        warm, cold = self.warm_and_cold(text)
+        self.assertEqual(warm, cold, label)
 
     def test_error_on_the_line_after_the_previous_sentence(self):
         self.assertSameAsCoqc(
@@ -94,15 +99,9 @@ class LocationTests(unittest.TestCase):
         diagnostics, and `render_all` compares diagnostics only, so cut
         `coqc`'s output at the first one.
         """
-        path = self.ws.write(self.NAME, text)
-        sess = session_mod.Session(path, self.ws.flags, cwd=self.ws.dir)
-        sess.start()
-        self.addCleanup(sess.stop)
-        result = sess.check(text, timeout=300)
-        _rc, cold = self.ws.coqc(self.NAME)
+        warm, cold = self.warm_and_cold(text)
         self.assertIn('File "', cold, "%s: coqc reported no diagnostic" % label)
-        self.assertEqual(render_all(result, self.NAME, text),
-                         cold[cold.index('File "'):], label)
+        self.assertEqual(warm, cold[cold.index('File "'):], label)
 
     def test_error_after_a_bare_show(self):
         """`-time` reports no range for a bare `Show.` -- `coqloop` answers it

@@ -74,12 +74,30 @@ rocq-warm check FILE.v --compile        # on success, also write the .vo (a real
 rocq-warm check FILE.v --rebuild        # first compile any stale dependency, in order
 rocq-warm check FILE.v --allow-stale    # check against stale dependencies anyway (warns)
 rocq-warm status                # what the daemon is holding
+rocq-warm status --json         # the same, for something that is not a person
 rocq-warm stop                  # free the sessions
 ```
 
 Exit codes: 0 the file checks, 1 it does not, 2 it could not be checked (a
-stale dependency, no daemon, no `rocq`), 3 a green verdict that a real
-`rocq compile` then rejected -- a bug in rocq-warm, please report it.
+stale dependency, the file is already being checked, no daemon, no `rocq`), 3 a
+green verdict that a real `rocq compile` then rejected -- a bug in rocq-warm,
+please report it.
+
+**One check per file at a time.** Different files check in parallel, which is
+the case that matters when several agents or terminals share a checkout. A
+second check of the *same* file is refused rather than queued:
+
+```console
+$ rocq-warm check proofs/Big.v
+rocq-warm: proofs/Big.v NOT CHECKED -- it is already being checked (47s so far)
+rocq-warm: one check per file at a time -- retry when it finishes, or check a different file
+```
+
+Exit 2 again, and not a verdict. Two `rocq repl` for one file would be twice
+several GB spent answering one question, and the second would pay a full cold
+start; run one after the other, the second replays warm in no measurable time.
+So the retry is the cheap part, and waiting would only have handed you that
+same instant replay at the end of the wait.
 
 ### What it prints
 

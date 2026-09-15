@@ -246,7 +246,47 @@ and they are not the problem.
 ## Sessions
 
 One daemon per workspace, one `rocq repl` per `.v` file, each child in its own
-process group. Sessions are keyed on the file, the build flags, and the
+process group.
+
+**At most one `rocq repl` per file, and it is borrowed rather than shared.**
+One table maps each file to a **slot**, which either holds that file's session
+or records that a check has borrowed it. A borrower gets the session that
+exists or starts the one that does not; a second check of the same file finds
+the slot borrowed and is refused rather than queued. So a session needs no
+lock of its own, because a borrowed one has exactly one user, and no thread
+ever waits on another thread's borrow — which leaves no lock ordering to
+establish between checks. The one lock there is guards the session table and
+the graph registry beside it, and is never held across anything that blocks.
+
+The waiting the daemon does do is on compiles, not on borrows: `_stale` and
+`_rebuild` block on the compiler's condition variable, always with the check's
+own deadline, because a `.vo` whose build is already running is a reason to
+wait rather than to refuse. That is the deliberate exception, and it is why
+`report_wedged` exists — a borrow held long past its deadline is not something
+the design rules out, it is something the daemon logs so the file's refusals
+can be traced back to the check still holding it.
+
+A slot never leaves the table, so every child that exists is reachable from it
+at every instant: there is no move for one to be lost in. What the slot keeps
+is what outlives any single session — when the file was last checked, and who
+has it now. What describes a particular `rocq repl` lives on the session
+itself: the flags and the switch it was spawned for, and the set of `.vo`
+files it has loaded. That placement is load-bearing rather than tidy. Throwing
+the process away throws that away with it, so nothing can survive while still
+describing a process that is gone, and the two cases that forced the old shape
+— a change of build flags or of toolchain, both fixed when a session is
+constructed — become an ordinary discard-and-respawn in the borrower's hands
+instead of a replacement in the table.
+
+Eviction and idle reaping borrow their victim like any other caller. Not
+ceremony: stopping a child waits on it, so it cannot happen under the table
+lock, and the borrow is what stops a check from starting on that file while
+its Rocq is being killed. A borrowed slot is never a candidate, which is the
+whole of "do not evict a session mid-check", and a slot borrowed with no
+session yet is a cold start in progress and counts against the budget, which
+is why room is made before spawning rather than after.
+
+Sessions are keyed on the file, the build flags, and the
 **toolchain**: the absolute `rocq` the client resolved plus the environment
 that resolved it (`PATH`, `OCAMLPATH`, `COQPATH`, `COQLIB`, …). A daemon
 outlives the shell that started it, and on a machine with several opam switches

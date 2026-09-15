@@ -22,6 +22,14 @@ HAVE_ROCQ = shutil.which("rocq") is not None and shutil.which("coqc") is not Non
 requires_rocq = unittest.skipUnless(
     HAVE_ROCQ, "needs rocq and coqc on PATH (eval $(opam env))")
 
+# Most of the suite compares against `coqc` and needs it.  The session-table
+# tests do not: they run `rocq repl` and assert on what the daemon owns, with
+# no oracle to consult.  Gating them on `coqc` as well would skip them on a
+# switch that ships only the 9.x `rocq` binary.
+HAVE_ROCQ_REPL = shutil.which("rocq") is not None
+requires_rocq_repl = unittest.skipUnless(
+    HAVE_ROCQ_REPL, "needs rocq on PATH (eval $(opam env))")
+
 
 class Workspace:
     """A throwaway one-file Rocq project."""
@@ -91,6 +99,20 @@ class Workspace:
 
     def cleanup(self):
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def alive(pid):
+    """Is `pid` a live process -- as opposed to gone, or an unreaped zombie?
+
+    A killed child whose parent has not waited on it still has a `/proc`
+    entry, so `os.kill(pid, 0)` calls it alive; every caller here is waiting
+    for a session to be *gone*, and a zombie is gone enough.
+    """
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
 
 
 def wait_for(pred, timeout=60, step=0.1):

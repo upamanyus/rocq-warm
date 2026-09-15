@@ -36,7 +36,6 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rocqwarm import project, session as session_mod          # noqa: E402
-from rocqwarm.diag import render                              # noqa: E402
 
 CHARS_RE = re.compile(r'^Chars (\d+) - (\d+) \[', re.M)
 # A whole `-time` line.  The bracketed display is not escaped and Iris tactics
