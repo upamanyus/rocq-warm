@@ -33,6 +33,7 @@ import threading
 import time
 
 from . import diag as diagmod
+from . import project
 from . import protocol
 
 # `Set Silent.` does not mean what its name suggests, and what it does depends
@@ -100,12 +101,25 @@ class MemoryLimit(Exception):
 
 class Session:
     def __init__(self, path, flags, cwd=None, write_ahead=DEFAULT_WRITE_AHEAD,
-                 env=None, rss_limit=None, rocq="rocq"):
+                 env=None, rss_limit=None, rocq="rocq", toolchain=None):
         self.path = os.path.abspath(path)
         self.flags = list(flags)
         self.cwd = cwd or os.path.dirname(self.path)
         self.write_ahead = write_ahead
         self.env = env
+        # What this session can answer for, and what it has answered against.
+        # Both belong to the process, not to the daemon's table: a session
+        # spawned for these flags and this switch cannot be reused for others,
+        # and the libraries below are the ones THIS `rocq repl` loaded.  Held
+        # here, they cannot outlive it.
+        self.toolchain = toolchain
+        # .vo path -> (mtime_ns, size) as each was when this session loaded it.
+        # Refilled after every check from what Rocq says it has loaded.
+        self.loaded = {}
+        # How many libraries that was.  The name -> path map that saves the
+        # work is `_libmap` below; this is only for `status` to show against
+        # `len(loaded)`, which is deliberately the wider set.
+        self.library_count = 0
         # The absolute `rocq` the CLIENT resolved, not whatever is on the
         # daemon's PATH.  A daemon outlives the shell that started it, and on a
         # machine with several opam switches the next caller may well be in a
@@ -186,6 +200,17 @@ class Session:
     @property
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
+
+    def loaded_changed(self):
+        """Has any .vo this session holds been rebuilt, removed or replaced?
+
+        The cache-invalidation test, and the reason a session is ever thrown
+        away: answering for a library that was replaced on disk an hour ago is
+        worse than not answering.  A missing file fingerprints as `(None,
+        None)`, so deletion and rebuild are the same comparison.
+        """
+        now = project.fingerprint(sorted(self.loaded))
+        return any(self.loaded[p] != (m, sz) for p, m, sz in now)
 
     def live_pid(self):
         """The child's pid, or None if there is no live child.

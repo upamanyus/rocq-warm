@@ -5,13 +5,13 @@ these drive a `Server` object in-process from two threads.  Everything being
 asserted here lives in the moment one thread wants a session another thread
 has, and reaching that moment needs a second request to arrive inside a window
 a subprocess cannot be aimed at.  Nothing here waits on a duration: the tests
-key off the session tables, so a slower machine only widens the window.
+key off the session table, so a slower machine only widens the window.
 
 The property underneath all of them is in `tearDown`, so it is checked by
 every test in the file and not just the one that mentions it: **no `rocq repl`
 this daemon spawned is alive unless the daemon can still reach it.**  That is
-what a session table is for, and every bug these tests were written for was a
-way of losing one.
+what the session table is for, and every bug these tests were written for was
+a way of losing one.
 """
 
 import os
@@ -42,7 +42,7 @@ class TrackingLock:
     """A lock that remembers which thread holds it.
 
     Only so a test can assert that some piece of work is NOT done under the
-    session tables' lock.  `threading.Lock` will say it is held; it will not
+    session table's lock.  `threading.Lock` will say it is held; it will not
     say by whom, and "held by somebody" is not the question.
     """
 
@@ -86,7 +86,7 @@ class ServerCase(unittest.TestCase):
         os.makedirs(self.srv.dir, exist_ok=True)
 
         # Every `rocq repl` this daemon spawns, whether or not the session
-        # tables still know about it -- which is the whole question here.
+        # table still knows about it -- which is the whole question here.
         self.spawned = []
         real_start = session_mod.Session.start
 
@@ -128,23 +128,30 @@ class ServerCase(unittest.TestCase):
         return t, out
 
     def wait_until_checking(self):
-        """Block until a check of self.path owns the file and has a rocq."""
+        """Block until a check of self.path has borrowed it and has a rocq."""
         self.assertTrue(
-            wait_for(lambda: os.path.abspath(self.path) in self.srv.busy
-                     and bool(self.spawned)),
+            wait_for(lambda: self.borrowed(self.path) and bool(self.spawned)),
             "the check never got going")
 
     # ------------------------------------------------------------ observing
 
     def slot(self, path=None):
-        key = os.path.abspath(path or self.path)
-        return self.srv.idle.get(key) or self.srv.busy.get(key)
+        return self.srv.sessions.get(os.path.abspath(path or self.path))
+
+    def borrowed(self, path=None):
+        slot = self.slot(path)
+        return slot is not None and slot.borrowed
+
+    def parked(self, path=None):
+        """The session sitting in the file's slot, if there is one."""
+        slot = self.slot(path)
+        return None if slot is None else slot.sess
 
     def tracked_pids(self):
         return [sess.live_pid() for _slot, sess in self.srv._live_sessions()]
 
     def leaked(self):
-        """Children that are alive but no longer reachable from the tables."""
+        """Children that are alive but no longer reachable from the table."""
         tracked = self.tracked_pids()
         return [p for p in self.spawned if alive(p) and p not in tracked]
 
@@ -157,34 +164,32 @@ class ServerCase(unittest.TestCase):
 
 
 class SlotTableTests(ServerCase):
-    """The tables themselves.  No rocq runs: a checkout spawns nothing."""
+    """The table itself.  No rocq runs: borrowing a slot spawns nothing."""
 
-    def test_a_returned_slot_is_handed_out_again(self):
-        """Check out, give back, check out: the same slot, not a new one.
+    def test_borrowing_twice_over_returns_the_same_slot(self):
+        """A slot is not made stale by having no session yet.
 
-        A slot is not made stale by having no session yet.  When it was, a
-        second check arriving in the window before the first had spawned
+        When it was, a second check arriving before the first had spawned
         anything replaced the first's slot and started a session of its own.
+        The slot is also the file's record across sessions, so it has to be
+        the same object the next time round.
         """
-        first = self.srv._checkout(self.path)
-        self.assertIsNone(first.sess, "a checkout should not have spawned yet")
-        self.srv._return(first)
-        # No session, so it is not parked: an empty slot describes nothing.
-        self.assertNotIn(self.path, self.srv.idle)
-        self.assertNotIn(self.path, self.srv.busy)
+        first = self.srv._borrow(self.path)
+        self.assertIsNone(first.sess, "a borrow should not have spawned yet")
+        self.srv._give_back(first)
 
-        second = self.srv._checkout(self.path)
-        self.addCleanup(self.srv._return, second)
-        self.assertIsNotNone(second)
+        second = self.srv._borrow(self.path)
+        self.addCleanup(self.srv._give_back, second)
+        self.assertIs(second, first)
 
-    def test_a_checked_out_file_is_refused_and_gets_no_second_slot(self):
+    def test_a_borrowed_file_is_refused_and_gets_no_second_slot(self):
         """The refusal has to come from a `return`, not a fall-through.
 
-        `_checkout` builds a `Slot` when it finds none.  If the busy test
-        fell through to that instead of returning, a second check would get
-        its own slot and its own `rocq repl` for a file somebody else is
-        already checking -- which is the bug this table shape removes, one
-        missing `return` away.
+        `_borrow` builds a `Slot` when it finds none.  If the `borrowed`
+        test fell through to that instead of returning, a second check would
+        get its own slot and its own `rocq repl` for a file somebody else is
+        already checking -- which is the bug this shape removes, one missing
+        `return` away.
         """
         built = []
         real_init = server_mod.Slot.__init__
@@ -193,12 +198,12 @@ class SlotTableTests(ServerCase):
             real_init(slot, path)
             built.append(path)
 
-        held = self.srv._checkout(self.path)
-        self.addCleanup(self.srv._return, held)
+        held = self.srv._borrow(self.path)
+        self.addCleanup(self.srv._give_back, held)
 
         server_mod.Slot.__init__ = counted_init
         self.addCleanup(setattr, server_mod.Slot, "__init__", real_init)
-        self.assertIsNone(self.srv._checkout(self.path))
+        self.assertIsNone(self.srv._borrow(self.path))
         self.assertEqual(built, [], "a second slot was built for a busy file")
 
     def test_a_slot_held_past_its_deadline_is_reported(self):
@@ -210,23 +215,22 @@ class SlotTableTests(ServerCase):
         instead, which is the difference between a diagnosable wedge and a
         file that mysteriously stopped being checkable.
         """
-        slot = self.srv._checkout(self.path)
-        self.addCleanup(self.srv._return, slot)
+        slot = self.srv._borrow(self.path)
+        self.addCleanup(self.srv._give_back, slot)
 
         slot.deadline = time.time() + 3600
         self.assertEqual(self.srv.report_wedged(), 0, "reported a live check")
 
         slot.deadline = time.time() - 120
         self.assertEqual(self.srv.report_wedged(), 1)
-        # Reported, not reclaimed.
-        self.assertIn(os.path.abspath(self.path), self.srv.busy)
+        self.assertTrue(self.borrowed(), "reported AND reclaimed")
 
-    def test_a_slot_is_never_in_both_tables(self):
-        slot = self.srv._checkout(self.path)
-        self.assertIn(self.path, self.srv.busy)
-        self.assertNotIn(self.path, self.srv.idle)
-        self.srv._return(slot)
-        self.assertNotIn(self.path, self.srv.busy)
+    def test_a_slot_holds_a_session_or_says_it_is_borrowed(self):
+        slot = self.srv._borrow(self.path)
+        self.assertTrue(slot.borrowed)
+        self.assertIsNone(slot.sess, "nothing is spawned by borrowing")
+        self.srv._give_back(slot)
+        self.assertFalse(slot.borrowed)
 
 
 @requires_rocq_repl
@@ -318,19 +322,18 @@ class ConcurrentCheckTests(ServerCase):
                             "--cold did not actually restart the session")
 
     def test_a_timed_out_check_leaves_the_file_checkable(self):
-        """A discarded session takes its slot with it, and blocks nothing.
+        """A discarded session leaves an empty slot, and blocks nothing.
 
         The cleanup used to resolve `_drop(path)` by key, so once the entry
         had been replaced it tore down somebody else's session instead of its
-        own.  There is nothing to resolve now: the check discards the slot it
-        is holding.
+        own.  There is nothing to resolve now: the check discards the session
+        in the slot it borrowed.
         """
         result = self.check(timeout=3)
         self.assertIn("timed out", result.get("error", ""), result)
 
-        key = os.path.abspath(self.path)
-        self.assertNotIn(key, self.srv.idle)
-        self.assertNotIn(key, self.srv.busy)
+        self.assertIsNone(self.parked(), "the session survived its timeout")
+        self.assertFalse(self.borrowed())
         self.assertEqual(self.tracked_pids(), [])
 
         again = self.check()
@@ -361,28 +364,29 @@ class SlotReturnTests(ServerCase):
         finally:
             session_mod.Session.check = real_check
 
-        self.assertNotIn(os.path.abspath(self.path), self.srv.busy)
+        self.assertFalse(self.borrowed(), "the slot was never given back")
         again = self.check()
         self.assertNotIn("busy", again, "the raising check never gave the slot back")
         self.assertTrue(again.get("passed"), again)
 
     def test_a_discarded_session_leaves_nothing_behind(self):
-        """`loaded` describes a process.  It must not outlive one.
+        """`loaded` describes a process, so it lives on the process.
 
-        A slot that kept a dead session's loaded set would hand the next check
-        a `watched` set, and `status` a row, about a session that no longer
-        exists -- quiet wrongness of exactly the kind the rest of this tool
-        refuses to produce.
+        Anything that outlived a `rocq repl` while still describing it would
+        hand the next check a `watched` set, and `status` a row, about a
+        session that no longer exists.  Holding it on the `Session` makes that
+        impossible rather than merely handled: there is nothing to clear,
+        because the object with the fields on it is the thing being dropped.
         """
         self.assertTrue(self.check().get("passed"))
-        slot = self.slot()
-        self.assertTrue(slot.loaded, "the check recorded nothing as loaded")
+        was = self.parked()
+        self.assertTrue(was.loaded, "the check recorded nothing as loaded")
+        self.assertTrue(was.library_count)
 
         self.assertTrue(self.srv._reclaim(os.path.abspath(self.path)))
-        self.assertIsNone(slot.sess)
-        self.assertEqual(slot.loaded, {})
-        self.assertEqual(slot.library_count, 0)
-        self.assertNotIn(os.path.abspath(self.path), self.srv.idle)
+        self.assertIsNone(self.parked(), "the slot kept its dead session")
+        self.assertIsNone(was.live_pid(), "the discarded child is still alive")
+        self.assertEqual(self.tracked_pids(), [])
 
 
 @requires_rocq_repl
@@ -410,25 +414,25 @@ class BookkeepingTests(ServerCase):
     def test_the_staleness_check_is_not_under_the_table_lock(self):
         """`loaded_changed` stats every .vo the session holds.
 
-        Under the tables' lock that is every other file's check waiting behind
-        a few hundred `stat` calls, which is the opposite of what a daemon
-        serving several files at once is for.
+        Under the session table's lock that is every other file's check
+        waiting behind a few hundred `stat` calls, which is the opposite of
+        what a daemon serving several files at once is for.
         """
         seen = []
-        real = server_mod.Slot.loaded_changed
+        real = session_mod.Session.loaded_changed
 
-        def watched(slot):
+        def watched(sess):
             seen.append(self.srv.lock.held_by_me())
-            return real(slot)
+            return real(sess)
 
         self.assertTrue(self.check().get("passed"))     # populates `loaded`
-        server_mod.Slot.loaded_changed = watched
-        self.addCleanup(setattr, server_mod.Slot, "loaded_changed", real)
+        session_mod.Session.loaded_changed = watched
+        self.addCleanup(setattr, session_mod.Session, "loaded_changed", real)
         self.assertTrue(self.check().get("passed"))     # ... and consults it
 
         self.assertTrue(seen, "loaded_changed was never consulted")
         self.assertNotIn(True, seen,
-                         "loaded_changed ran under the session tables' lock")
+                         "loaded_changed ran under the session table's lock")
 
 
 @requires_rocq_repl
