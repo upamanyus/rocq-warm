@@ -391,7 +391,7 @@ class SlotReturnTests(ServerCase):
         """
         real_check = session_mod.Session.check
 
-        def exploding_check(sess, text, timeout=1800):
+        def exploding_check(sess, text, timeout=1800, cancelled=None):
             raise RuntimeError("boom")
 
         session_mod.Session.check = exploding_check

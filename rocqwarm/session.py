@@ -75,6 +75,23 @@ class MemoryLimit(Exception):
     """The session outgrew its RSS ceiling and was killed."""
 
 
+class Abandoned(Exception):
+    """Nobody is waiting for this check any more.
+
+    Raised when the client that asked for it went away -- a Ctrl+C, a closed
+    terminal -- so there is no verdict to report and no reason to keep
+    proving.  The session is not the casualty: it is left parked at the
+    sentence the interrupt stopped Rocq on, with everything that did execute
+    recorded, so the next check of the file replays from there.  `items` and
+    `base` carry that executed work back to the caller.
+    """
+
+    def __init__(self, why, items=(), base=0):
+        Exception.__init__(self, why)
+        self.items, self.base = items, base
+        self.line = None            # where it stopped, once it is parked
+
+
 class Session:
     def __init__(self, path, flags, cwd=None, env=None, rss_limit=None,
                  rocq="rocq", toolchain=None):
@@ -332,11 +349,19 @@ class Session:
 
     # ------------------------------------------------------------------ feed
 
-    def _feed_raw(self, data, timeout, stop_on_error=False):
+    def _feed_raw(self, data, timeout, stop_on_error=False, cancelled=None):
         """Feed `data`, wait for it to execute, return its sentences.
 
         A trailing sentinel makes "done" exact: a slow tactic and a finished
         feed are otherwise indistinguishable from outside.
+
+        `cancelled` is an event the caller sets when nobody is waiting for the
+        answer any more.  Feeding then stops, the sentence Rocq is on is
+        interrupted, and `Abandoned` is raised carrying what did execute --
+        from a session still at a prompt, because being left usable is the
+        whole point of interrupting it rather than killing it.  The feeds that
+        keep a session consistent (the prologue, `BackTo`, recovery) pass no
+        event: cutting one of those short is what would lose the session.
         """
         self._sentinel += 1
         sentinel = (SENTINEL_FMT % self._sentinel)
@@ -357,8 +382,8 @@ class Session:
         writer.start()
         try:
             try:
-                stopped_early = self._await_sentinel(
-                    sentinel_pat, timeout, stop_on_error)
+                stopped_early, gone = self._await_sentinel(
+                    sentinel_pat, timeout, stop_on_error, cancelled)
             except Unterminated:
                 # All written and Rocq still waiting: the text ended inside a
                 # sentence, comment or string, swallowing the sentinel.  Close
@@ -369,9 +394,10 @@ class Session:
                 self._trim_to_last_prompt()
                 raise
             if stopped_early:
-                # Stopped mid-chunk, so Rocq waits for the rest of a sentence
-                # and never reaches the queued sentinel.  Close what is
-                # lexically open, terminate, and re-send it.
+                # Stopped mid-chunk -- behind an error, or because the client
+                # went away -- so Rocq waits for the rest of a sentence and
+                # never reaches the queued sentinel.  Close what is lexically
+                # open, terminate, and re-send it.
                 self._stop_writing.set()
                 writer.join(timeout=10)
                 self._interrupt_stalled_work()
@@ -395,6 +421,10 @@ class Session:
                 break
         items = items[:end]
         self._trim_to_last_prompt()
+        if gone:
+            # At a prompt, with the executed sentences in hand: the caller
+            # records them and parks the session on the last of them.
+            raise Abandoned("the client went away", items, base)
         return items, base
 
     def _recover(self, data, base, timeout):
@@ -463,7 +493,7 @@ class Session:
                 self._sigint()
                 stuck_since = now
 
-    def _await_sentinel(self, pat, timeout, stop_on_error=False):
+    def _await_sentinel(self, pat, timeout, stop_on_error=False, cancelled=None):
         """Wait for the sentinel and the prompt that follows it.
 
         Both, because on the sentinel's `Chars` line alone the following prompt
@@ -471,6 +501,14 @@ class Session:
         in the buffer and the next feed parses it as one of its own sentences,
         with offsets from the previous chunk.  That corrupts the sentence map
         and makes the next replay resume mid-sentence.
+
+        Returns `(stopped_early, gone)`: whether the feed was cut short
+        mid-chunk, so the caller must close the sentence Rocq is waiting on,
+        and whether it was cut short because the client went away.  The two
+        are separate answers -- a cancelled feed whose text was already
+        written in full has nothing left to close -- and `done()` is consulted
+        before either, so a feed that finished on its own reports a verdict
+        rather than an abandonment.
         """
         def done():
             m = pat.search(self.buf)
@@ -498,20 +536,35 @@ class Session:
         last_parsed, last_out = self.parsed_end, len(self.buf)
         stuck_since = time.time()
         error_seen = False
+        gone = False
         while True:
             with self._cv:
                 if done():
-                    return False
+                    return False, gone
                 if not self.alive:
                     raise SessionDead(self._death_note("mid-feed"))
                 if stop_on_error and not error_seen and hit_error():
                     error_seen = True
                     self._stop_writing.set()
                     if not self._write_done.is_set():
-                        return True     # caller closes the sentence and retries
+                        return True, gone   # caller closes the sentence and retries
+                if not gone and cancelled is not None and cancelled.is_set():
+                    # Nobody is waiting for this answer any more.  Stop
+                    # feeding and interrupt below, exactly as behind an error:
+                    # the remaining work is work no one asked for, and the
+                    # session is worth more parked than finished.
+                    gone = True
+                    self._stop_writing.set()
+                    if not self._write_done.is_set():
+                        return True, True
+                    # Everything, sentinel included, is already in Rocq's
+                    # hands, so it will reach a prompt on its own and there is
+                    # nothing to close.  Wait for it -- interrupting what is
+                    # running -- rather than writing a terminator behind a
+                    # sentinel that has yet to execute.
                 self._cv.wait(0.25)
                 if done():
-                    return False
+                    return False, gone
             now = time.time()
             if now > deadline:
                 raise FeedTimeout("feed exceeded %.0fs" % timeout)
@@ -524,10 +577,13 @@ class Session:
                     self.parsed_end, len(self.buf), now)
             ticks = self._cpu_ticks()
             if ticks is None or ticks != last_ticks:
-                if error_seen and now - stuck_since > INTERRUPT_STALL:
+                if (error_seen or gone) and now - stuck_since > INTERRUPT_STALL:
                     # One command running long behind a known error, on a goal
-                    # of the wrong shape, printing nothing.  See `_sigint` for
-                    # why the predicate must be that narrow.
+                    # of the wrong shape, printing nothing -- or one running
+                    # for a client that has gone.  See `_sigint` for why the
+                    # predicate must be that narrow either way: a signal
+                    # delivered a moment too early kills the session outright,
+                    # which is the one outcome an interrupt must not produce.
                     self._sigint()
                     stuck_since = now
                 last_ticks, last_move = ticks, now
@@ -700,22 +756,32 @@ class Session:
                 return ("shift", delta, k)
         return ("replay", prev.end, prev.state_after)
 
-    def check(self, text, timeout=1800, _retry=True):
+    def check(self, text, timeout=1800, _retry=True, cancelled=None):
         """Execute `text`, reusing as much of the warm prefix as is sound.
 
         A child that dies mid-check, from a neighbour's `pkill` or an interrupt
         landing badly, costs a cold run rather than an error.
+
+        `cancelled` is an event the caller sets when the client that asked for
+        this check has gone; `Abandoned` is then raised instead of a verdict,
+        from a session parked at the line Rocq had reached.
         """
         try:
-            return self._check(text, timeout)
+            return self._check(text, timeout, cancelled)
         except SessionDead:
             if not _retry:
                 raise
             self.stop()
+            if cancelled is not None and cancelled.is_set():
+                # The retry is a COLD run of the whole file, which is the
+                # work the interrupt asked us to stop.  There is nobody to
+                # answer, so the session is left dead for the next check to
+                # replace rather than re-proving a file for no one.
+                raise Abandoned("rocq died as the client went away")
             self.start()
             return self.check(text, timeout=timeout, _retry=False)
 
-    def _check(self, text, timeout):
+    def _check(self, text, timeout, cancelled=None):
         t0 = time.time()
         plan = self.plan(text)
         mode = plan[0]
@@ -748,14 +814,20 @@ class Session:
                 keep += 1
             del self.sentences[keep:]
 
+        if cancelled is not None and cancelled.is_set():
+            # Gone before a single sentence of this check ran.  What the
+            # session holds is the prefix the replay kept, and it has to be
+            # left saying so: `text` outrunning the sentence map is what makes
+            # the next check resume from a state Rocq is not in.
+            self._park_at(text[:resume])
+            raise Abandoned("the client went away before the check started")
+
         try:
             items, base = self._feed_raw(text[resume:], timeout=timeout,
-                                         stop_on_error=True)
+                                         stop_on_error=True,
+                                         cancelled=cancelled)
         except Unterminated:
-            self.text = text[:resume]
-            self.complete = False
-            if self.sentences:
-                self._backtrack(self.sentences[-1].state_after)
+            self._park_at(text[:resume])
             return CheckResult(
                 False,
                 self._prefix_diags() + [Diag(
@@ -764,7 +836,24 @@ class Session:
                     b"unterminated sentence")],
                 mode=mode, replayed=0, seconds=time.time() - t0,
                 total=len(self.sentences))
+        except Abandoned as gone:
+            # Interrupted part-way through.  What executed before the signal
+            # is real work on a session that is still at a prompt, so it is
+            # recorded exactly as a verdict's would be -- the result is simply
+            # thrown away, because there is nobody it is for.
+            self._conclude(text, gone.items, gone.base, resume, mode, t0)
+            gone.line = self.text.count(b"\n") + 1
+            raise
+        return self._conclude(text, items, base, resume, mode, t0)
 
+    def _conclude(self, text, items, base, resume, mode, t0):
+        """Record what a feed executed, and say what it found.
+
+        Called however the feed ended, with a verdict or with an interrupt:
+        the session state left behind -- the sentence map, the parked prefix,
+        the state Rocq sits in -- is the same either way, and is what makes
+        the next check a replay from the line this one reached.
+        """
         self.text_being_fed = text
         items = self._absorb(items, base, resume, len(text))
         first_bad = next((i for i, it in enumerate(items) if it.failed), None)
@@ -788,13 +877,25 @@ class Session:
         else:
             # Parked at the broken sentence, so the next edit, which is the fix
             # for it, replays from here and nothing before.
-            self.text = text[:items[first_bad].start]
-            self.complete = False
-            if self.sentences:
-                self._backtrack(self.sentences[-1].state_after)
+            self._park_at(text[:items[first_bad].start])
         return CheckResult(first_bad is None, diags, mode=mode,
                            replayed=len(items), seconds=time.time() - t0,
                            total=len(self.sentences))
+
+    def _park_at(self, prefix):
+        """Leave the session consistent, holding `prefix` and nothing more.
+
+        Every way of stopping short ends here: a broken sentence, a file that
+        ended mid-sentence, a client that went away.  `text` must never claim
+        more than the sentence map covers -- `plan` reads the two together,
+        and a longer `text` makes the next check resume from a state Rocq is
+        not in -- and Rocq itself must be back at the last sentence the map
+        ends on, whatever the failed one left behind.
+        """
+        self.text = prefix
+        self.complete = False
+        if self.sentences:
+            self._backtrack(self.sentences[-1].state_after)
 
     def _prefix_diags(self):
         """The errors and warnings of the sentences being kept, not their

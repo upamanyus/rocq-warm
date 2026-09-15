@@ -26,6 +26,12 @@ import time
 from . import project, server
 
 
+# 128 + SIGINT, the shell's own convention for a command that was interrupted.
+# Deliberately outside the 0-3 range a verdict uses: an interrupted check has
+# no verdict, and reporting one of theirs would be a lie in whichever
+# direction the caller happened to read it.
+INTERRUPTED_EXIT = 130
+
 # The variables that decide WHICH Rocq runs and where it finds libraries.  The
 # daemon spawns its sessions with exactly these, taken from the client, so a
 # session behaves like the shell that invoked it.
@@ -101,6 +107,12 @@ def spawn_daemon(root):
 
 
 def request(root, msg, spawn=True):
+    """Ask the daemon one thing and wait for its answer.
+
+    The close in the `finally` is load-bearing on the way out of a Ctrl+C:
+    the EOF it sends is how the daemon learns that nobody is waiting for the
+    check any more.
+    """
     sock = connect(root, spawn=spawn)
     if sock is None:
         return None
@@ -126,13 +138,25 @@ def cmd_check(args):
     if not os.path.isfile(path):
         raise SystemExit("rocq-warm: no such file: %s" % path)
     rocq, env = rocq_environment()
-    resp = request(workspace_for(path),
-                   {"cmd": "check", "path": path, "cold": args.cold,
-                    "timeout": args.timeout,
-                    "rocq": rocq, "env": env,
-                    "allow_stale": args.allow_stale,
-                    "rebuild": args.rebuild,
-                    "wait_vo": args.compile})
+    try:
+        resp = request(workspace_for(path),
+                       {"cmd": "check", "path": path, "cold": args.cold,
+                        "timeout": args.timeout,
+                        "rocq": rocq, "env": env,
+                        "allow_stale": args.allow_stale,
+                        "rebuild": args.rebuild,
+                        "wait_vo": args.compile})
+    except KeyboardInterrupt:
+        # Closing the socket is the whole message, and `request` has already
+        # done it: the daemon reads that EOF as "nobody is waiting", stops the
+        # sentence Rocq is on and parks the session there.  We do not wait to
+        # be told it worked -- waiting is what Ctrl+C asked us to stop doing,
+        # and the session is the daemon's to look after either way.
+        sys.stderr.write(
+            "rocq-warm: interrupted -- the warm session is being stopped at "
+            "the line it reached, and kept; the next check of this file "
+            "resumes from there\n")
+        return INTERRUPTED_EXIT
     if resp is None:
         sys.stderr.write("rocq-warm: no response\n")
         return 2
@@ -167,12 +191,15 @@ def cmd_stop(args):
 # was only a dependency to rebuild.
 CHECK_EPILOG = """\
 exit codes:
-  0  the file checks
-  1  it does not -- a verdict about the proof
-  2  it could NOT be checked, which is not a verdict about the proof: a
-     stale dependency, the file is already being checked, no daemon, no rocq
-  3  a green verdict that a real `rocq compile` then rejected -- a bug in
-     rocq-warm, please report it
+    0  the file checks
+    1  it does not -- a verdict about the proof
+    2  it could NOT be checked, which is not a verdict about the proof: a
+       stale dependency, the file is already being checked, no daemon, no rocq
+    3  a green verdict that a real `rocq compile` then rejected -- a bug in
+       rocq-warm, please report it
+  130  interrupted with Ctrl+C, so there is no verdict either.  The session
+       is stopped at the line it had reached and kept warm, so the next check
+       of the file resumes from there
 
 A plain check writes no .vo -- this is an edit-loop tool, not a build tool --
 so anything that requires this file still reads the library from before the
@@ -216,7 +243,13 @@ def main(argv=None):
     k.set_defaults(func=cmd_stop)
 
     args = ap.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        # A Ctrl+C anywhere but the wait `cmd_check` handles for itself: on
+        # its way through `status`, or through resolving the workspace.  A
+        # traceback would be the only thing wrong with it.
+        return INTERRUPTED_EXIT
 
 
 if __name__ == "__main__":

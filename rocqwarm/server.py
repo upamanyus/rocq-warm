@@ -13,6 +13,12 @@ and a green check, which writes no `.vo`, says so.  Sessions over their RSS
 ceiling and checks over their wall timeout are killed and reported; sessions
 are evicted LRU under a memory budget, and idle ones time out.
 
+A client that goes away -- Ctrl+C, a closed terminal -- is noticed as an EOF
+on its connection, and its check is abandoned rather than run to completion
+for nobody: Rocq is interrupted where it stands, and the session goes back
+into the table parked at that line, so the file is checkable again in seconds
+instead of at the end of a proof no one is waiting for.
+
 `self.sessions` maps each file to a `Slot` holding the file's session or marked
 borrowed by a running check, giving at most one `rocq repl` per file and one
 check of it at a time.  A borrower takes the session that exists or starts the
@@ -26,6 +32,7 @@ import contextlib
 import fcntl
 import json
 import os
+import select
 import signal
 import socket
 import struct
@@ -39,6 +46,13 @@ from . import (compile as compile_mod, diag, project, report,
 DEFAULT_IDLE_TIMEOUT = 1800.0
 DEFAULT_MAX_SESSIONS = 4
 DEFAULT_CHECK_TIMEOUT = 1800.0
+
+# How often a connection is looked at while its request runs, and how long its
+# watcher is given to notice that the request is over.  The poll costs one
+# `select` per connection per interval and decides how soon a Ctrl+C is acted
+# on, which is a small fraction of the time interrupting Rocq takes anyway.
+WATCH_POLL = 0.2
+WATCH_JOIN_TIMEOUT = 2.0
 
 
 # Absolute caps rather than a share of RAM: a per-checkout daemon that takes
@@ -92,6 +106,15 @@ def _session_ceiling(budget):
     # Half the budget, not a share per session: one big proof legitimately
     # costs several GB, and a ceiling that kills it is worse than none.
     return budget / 2.0
+
+
+def _gone(cancelled):
+    """Has the client that asked for this work gone away?
+
+    A `None` event is a caller that cannot be cancelled -- a test, the reaper
+    -- rather than a client that is still there, so it never cancels.
+    """
+    return cancelled is not None and cancelled.is_set()
 
 
 def _toolchain_env(toolchain):
@@ -402,10 +425,10 @@ class Server:
 
     # -------------------------------------------------------------- requests
 
-    def handle(self, req):
+    def handle(self, req, cancelled=None):
         cmd = req.get("cmd")
         if cmd == "check":
-            return self.do_check(req)
+            return self.do_check(req, cancelled=cancelled)
         if cmd == "status":
             return self.do_status()
         if cmd == "stop":
@@ -416,21 +439,28 @@ class Server:
             return {"ok": True, "pid": os.getpid()}
         return {"ok": False, "error": "unknown command %r" % cmd}
 
-    def do_check(self, req):
+    def do_check(self, req, cancelled=None):
         """Check a file; the reply carries what to print and what to exit with.
 
         Rendering is in `report`, on this side of the socket, where the checked
         text, the workspace root and the compile job are.  The exit code is
         policy -- 1 "the proof is wrong" against 2 "never checked" -- so it is
         decided once, here.
+
+        `cancelled` is set when the client asking goes away.  The reply is
+        still rendered -- one shape of response, whatever became of it -- and
+        then has nobody to go to.
         """
         path = os.path.abspath(req["path"])
-        resp = self._check(path, req)
+        resp = self._check(path, req, cancelled)
         resp["out"], resp["log"], resp["exit"] = report.check(
             resp, path, self.root, req)
         return resp
 
-    def _check(self, path, req):
+    def _check(self, path, req, cancelled=None):
+        if _gone(cancelled):
+            return self._abandoned(path, "the client went away before its "
+                                         "check had started")
         try:
             text = open(path, "rb").read()
         except OSError as e:
@@ -457,18 +487,26 @@ class Server:
 
         # Refuse to check against a library that no longer matches its
         # source.  A compile we started ourselves is waited for instead.
-        stale = self._stale(closure, graph, deadline=t0 + timeout)
+        stale = self._stale(closure, graph, deadline=t0 + timeout,
+                            cancelled=cancelled)
         if stale and req.get("rebuild"):
             failure = self._rebuild(closure, stale, graph, rocq, env,
                                     deadline=t0 + timeout)
             if failure is not None:
                 return failure
-            stale = self._stale(closure, graph, deadline=t0 + timeout)
+            stale = self._stale(closure, graph, deadline=t0 + timeout,
+                                cancelled=cancelled)
         stale_rows = [self._stale_row(vo, why) for vo, why in stale]
         if stale and not req.get("allow_stale"):
             return {"ok": False, "stale": stale_rows,
                     "error": "%d stale dependenc%s" % (
                         len(stale), "y" if len(stale) == 1 else "ies")}
+
+        if _gone(cancelled):
+            # Nothing has been borrowed and no rocq has been spawned yet, so
+            # there is nothing to unwind: just do not start.
+            return self._abandoned(path, "the client went away before the "
+                                         "session was borrowed")
 
         # One check per file at a time.  Refused rather than queued: what a
         # waiter would wait on is a proof, so no deadline would be honest.
@@ -490,7 +528,23 @@ class Server:
                               _session_ceiling(self.budget), pre)
             self._record_sessions()     # there is a pid now, and not before
             try:
-                result = sess.check(text, timeout=timeout)
+                result = sess.check(text, timeout=timeout, cancelled=cancelled)
+            except session_mod.Abandoned as e:
+                # The client went away mid-check.  Rocq was interrupted where
+                # it stood rather than killed, so the session is still worth
+                # something: it goes back into the table parked at that line,
+                # and the next check of this file replays from there.  What it
+                # loaded is recorded as after any other check -- an
+                # interrupted run may still have loaded a library, and a
+                # session whose `.vo` set is not written down is one that
+                # could answer for a library that no longer exists.
+                if sess.alive:
+                    self._record_loaded(slot, sess, watched, pre)
+                else:
+                    slot.discard()
+                return self._abandoned(
+                    path, "%s; %d sentences executed, parked at line %s"
+                    % (e, len(sess.sentences), e.line))
             except session_mod.FeedTimeout as e:
                 slot.discard()
                 return {"ok": False, "error": "timed out after %.0fs (%s); "
@@ -503,33 +557,20 @@ class Server:
             except session_mod.SessionDead as e:
                 slot.discard()
                 return {"ok": False, "error": "rocq died: %s" % e}
-            unreliable = None
-            try:
-                libraries = sess.loaded_libraries()
-            except Exception as e:                      # noqa: BLE001
-                libraries, unreliable = {}, "%s: %s" % (type(e).__name__, e)
-            rss = sess.rss_bytes()
-            post = {p: (m, sz) for p, m, sz in project.fingerprint(
-                sorted(set(watched) | set(libraries.values())))}
-            moved = [p for p in watched if pre[p] != post[p]]
-            note = None
-            if moved:
-                note = ("%s changed during the check; the verdict may be about "
-                        "either version, and the session was discarded"
-                        % ", ".join(os.path.relpath(p, self.root) for p in moved))
-                slot.discard()
-            elif unreliable:
-                note = ("could not ask rocq what it loaded (%s); the session "
-                        "was discarded" % unreliable)
-                slot.discard()
-            else:
-                sess.loaded = {p: pre.get(p, post[p]) for p in post}
+            note, moved, rss = self._record_loaded(slot, sess, watched, pre)
         # Checkable again from here: `--compile` runs a real `rocq compile`
         # for minutes and touches no session, so it is outside the borrow.
         compile_mod.log("check: %s %s [%s, %d sentences, %.1fs]%s", path,
                         "OK" if result.ok else "FAILED", result.mode,
                         result.replayed, result.seconds,
                         "; " + note if note else "")
+        if _gone(cancelled):
+            # The check ran to the end and the client left before hearing it.
+            # The session is warm and back in the table either way; what is
+            # dropped is the verdict, and `--compile`, which is minutes of
+            # real compiling nobody asked for any more.
+            return self._abandoned(path, "the client went away before the "
+                                         "verdict could be sent")
         job = None
         if result.ok and not moved and req.get("wait_vo"):
             job = self.compiler.submit(path, flags, cwd, rocq=rocq, env=env,
@@ -579,20 +620,79 @@ class Server:
                 "error": "one check per file at a time, and this file is "
                          "already being checked"}
 
+    def _record_loaded(self, slot, sess, watched, pre):
+        """Write down the `.vo` set the session now holds, or discard it.
+
+        A session may answer only for libraries it can be checked against
+        next time, so a check ends by asking Rocq what it loaded and
+        fingerprinting that.  Where the answer cannot be trusted -- a watched
+        `.vo` changed while the check ran, or Rocq could not be asked -- the
+        session is discarded rather than kept with a `loaded` set that does
+        not describe it.
+
+        Owed by every check, the abandoned ones included: an interrupted run
+        has loaded whatever it loaded before the signal.
+
+        Returns `(note, moved, rss)`: what to warn about, which watched files
+        changed under the check, and what the child costs now.
+        """
+        unreliable = None
+        try:
+            libraries = sess.loaded_libraries()
+        except Exception as e:                      # noqa: BLE001
+            libraries, unreliable = {}, "%s: %s" % (type(e).__name__, e)
+        rss = sess.rss_bytes()
+        post = {p: (m, sz) for p, m, sz in project.fingerprint(
+            sorted(set(watched) | set(libraries.values())))}
+        moved = [p for p in watched if pre[p] != post[p]]
+        note = None
+        if moved:
+            note = ("%s changed during the check; the verdict may be about "
+                    "either version, and the session was discarded"
+                    % ", ".join(os.path.relpath(p, self.root) for p in moved))
+            slot.discard()
+        elif unreliable:
+            note = ("could not ask rocq what it loaded (%s); the session "
+                    "was discarded" % unreliable)
+            slot.discard()
+        else:
+            sess.loaded = {p: pre.get(p, post[p]) for p in post}
+        return note, moved, rss
+
+    def _abandoned(self, path, why):
+        """A check nobody is waiting for any more.
+
+        Neither a verdict nor a refusal of anything: the client that asked
+        went away, so there is nothing to answer and nobody to answer it to.
+        The session it was using is kept -- interrupted where it stood, parked
+        at that line, back in the table -- because the next check of the file
+        replays from there, which is the whole reason to interrupt a `rocq
+        repl` rather than kill it.
+
+        Rendered like any other response, since the daemon cannot know that
+        the socket is closed until it writes to it; the log line here is what
+        actually records what happened.
+        """
+        compile_mod.log("check: %s ABANDONED -- %s", path, why)
+        return {"ok": False, "abandoned": True,
+                "error": "the check was abandoned: %s" % why}
+
     # ------------------------------------------------------------ staleness
 
-    def _stale(self, closure, graph, deadline):
+    def _stale(self, closure, graph, deadline, cancelled=None):
         """Stale members of `closure`, after waiting for our own compiles.
 
         A `.vo` still stale because its compile has not finished is a reason
         to wait, not to refuse.  Only this daemon's own jobs are waited for; a
-        `make` in another terminal is invisible to us.
+        `make` in another terminal is invisible to us.  A client that has gone
+        is nobody to wait on behalf of, so the wait ends there and the caller
+        abandons the check.
         """
         while True:
             stale = project.stale_deps(closure, graph.graph)
             pending = [j for j in (self.compiler.pending(vo) for vo, _w in stale)
                        if j is not None]
-            if not pending or time.time() >= deadline:
+            if not pending or time.time() >= deadline or _gone(cancelled):
                 return stale
             for j in pending:
                 self.compiler.wait(j.v, timeout=max(0.0, deadline - time.time()))
@@ -750,18 +850,41 @@ class Server:
         os._exit(0)
 
     def _serve_one(self, conn):
+        """Answer one request, and watch for the client leaving while we do.
+
+        The watcher is what makes a Ctrl+C mean something on this side: the
+        request it belongs to reads the event and stops, instead of proving a
+        file for a process that no longer exists.  It is started after the
+        request is read and joined before the connection is closed, so no
+        thread is ever left polling an fd the daemon has handed back to the
+        kernel.
+        """
+        gone, done = threading.Event(), threading.Event()
+        watcher = None
         try:
             req = recv_msg(conn)
             if req is None:
                 return
+            watcher = threading.Thread(target=_watch_peer,
+                                       args=(conn, gone, done), daemon=True)
+            watcher.start()
             try:
-                resp = self.handle(req)
+                resp = self.handle(req, cancelled=gone)
             except Exception as e:                      # never take the daemon
                 resp = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
-            send_msg(conn, resp)
+            try:
+                send_msg(conn, resp)
+            except OSError as e:
+                # The client went away between asking and being answered,
+                # which is exactly what `gone` is for; the check has already
+                # stopped, and there is nothing left to report to.
+                compile_mod.log("reply to a client that had gone: %s", e)
             if req.get("cmd") == "stop":
                 os._exit(0)
         finally:
+            done.set()
+            if watcher is not None:
+                watcher.join(timeout=WATCH_JOIN_TIMEOUT)
             try:
                 conn.close()
             except Exception:
@@ -774,6 +897,37 @@ def _describe_job(job):
     d = job.describe()
     d["output"] = job.output.decode("utf8", "replace")
     return d
+
+
+def _watch_peer(conn, gone, done, step=WATCH_POLL):
+    """Set `gone` when the client disappears before its reply.
+
+    An interrupted client -- Ctrl+C, a closed terminal, a SIGKILL -- leaves
+    the kernel to close its end of the socket, and that EOF is the only notice
+    the daemon gets that nobody is waiting any more.  Waiting for the client
+    to say so instead would miss every way of dying that runs no code.
+
+    The EOF is unambiguous here because the protocol is one request and one
+    reply: the client has already sent everything it will ever send, so a
+    readable socket with nothing to read is the peer being gone, and anything
+    else is a client talking out of turn, which is not our business.
+
+    Polled rather than left blocking in `recv`, so this thread is finished
+    before the connection is closed.  A `recv` still blocked on a closed fd
+    would wake on whatever the next thread put in its place.
+    """
+    while not done.is_set():
+        try:
+            if not select.select([conn], [], [], step)[0]:
+                continue
+            if conn.recv(4096, socket.MSG_DONTWAIT):
+                continue                # talking out of turn; not an EOF
+        except BlockingIOError:
+            continue                    # readable, then not: still connected
+        except (OSError, ValueError):
+            pass                        # a broken connection is a gone client
+        gone.set()
+        return
 
 
 def send_msg(sock, obj):

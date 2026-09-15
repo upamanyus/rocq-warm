@@ -243,6 +243,60 @@ looks exactly like a stuck tactic. Hence: burning CPU, no new sentence, no new
 output, for two seconds. Short sentences are left to finish; they are cheap,
 and they are not the problem.
 
+## Interrupting a check
+
+A client that goes away — Ctrl+C, a closed terminal, an agent that gave up —
+used to cost as much as one that stayed. The check ran to the end for nobody,
+and because a file is checked out for as long as its check runs, every later
+check of that file was refused as busy until it finished: up to the half-hour
+wall timeout, on the one file the person was working on.
+
+The notice is an **EOF on the connection**, not a signal and not a message.
+The protocol is one request and one reply, so a client has already sent
+everything it will ever send by the time the check starts, and a socket that
+becomes readable can only be saying that the peer is gone. That covers every
+way of dying, including the ones that run none of the client's own code — and
+it has to, because the daemon is detached into a session of its own, so a
+terminal's Ctrl+C never reaches it. One watcher thread per connection polls
+for the EOF and sets an event the check reads; it is started after the request
+is read and joined before the connection is closed, so nothing is ever left
+polling an fd that has been handed back to the kernel and reissued to somebody
+else.
+
+What the check does about it is what it already does behind an error: stop
+feeding, and SIGINT the running command once — and only once — the predicate
+above holds. The reuse is the point. The delicate part of interrupting Rocq is
+that predicate, and a second implementation of it with one clause relaxed
+would be a session that dies whenever the signal lands while it is formatting
+a goal. So an interrupt is slower to take effect than it could be, by about
+two seconds, in exchange for not being able to kill the thing it is trying to
+preserve.
+
+Then the session is left exactly as a failed sentence leaves it: Rocq
+backtracked to the last sentence that succeeded, the sentence map truncated to
+match, and `text` cut down to the prefix that really executed. The last of
+those is what makes an interrupt cheap rather than merely survivable — the
+next check sees a prefix and replays from the interrupted line — and it is
+also the one invariant an interrupt could quietly break, since a `text` that
+claims more than the sentence map covers makes the *next* check resume from a
+state Rocq is not in. Every way of stopping short therefore goes through one
+`_park_at`, rather than each writing those three assignments for itself.
+
+Two smaller consequences follow from there being nobody to answer. The `.vo`
+set the session loaded is still recorded, because an interrupted run has
+loaded whatever it loaded, and a session whose libraries are not written down
+is one that could later answer for a library that no longer exists. And
+`--compile` is not *started*: it is minutes of real compiling, and the request
+for it left with the client. One already running is left to finish, since it
+writes a `.vo` that a later check or a `make` can use and cancelling a compile
+deletes what it wrote; it holds no session and blocks nothing while it runs.
+
+The slot goes back into the table with its session in it, which is the
+difference a user sees — the file is checkable again in the couple of seconds
+the interrupt takes, rather than at the end of a proof nobody was waiting for.
+There is no verdict, and the exit code says so: 130, not 1. The question was
+withdrawn, not answered.
+
 ## Sessions
 
 One daemon per workspace, one `rocq repl` per `.v` file, each child in its own
