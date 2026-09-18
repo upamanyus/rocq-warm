@@ -243,6 +243,100 @@ looks exactly like a stuck tactic. Hence: burning CPU, no new sentence, no new
 output, for two seconds. Short sentences are left to finish; they are cheap,
 and they are not the problem.
 
+## Interrupting a check
+
+A client that goes away — Ctrl+C, a closed terminal, an agent that gave up —
+used to cost as much as one that stayed. The check ran to the end for nobody,
+and because a file is checked out for as long as its check runs, every later
+check of that file was refused as busy until it finished: up to the half-hour
+wall timeout, on the one file the person was working on.
+
+The notice is an **EOF on the connection**, not a signal and not a message.
+That covers every way of dying, including the ones that run none of the
+client's own code — and it has to, because the daemon is detached into a
+session of its own, so a terminal's Ctrl+C never reaches it. One watcher
+thread per connection waits for it and sets an event the check reads.
+
+It *waits*, with no timeout and no poll interval to justify, and that takes a
+second thing to wait on. A thread blocked on the connection alone would still
+be blocked once the request was over, and `close()` does not wake a blocked
+reader: it would sit there until the fd number was reissued to another thread
+and then read somebody else's connection. So each request makes a socketpair
+and the watcher selects on both. Closing the request thread's end is one
+action that ends the watcher and says why, and because the wake-up is
+self-identifying — which fd is ready says whether the client did something or
+the request is simply over — "stop" and "the client spoke" are told apart
+structurally rather than by the order two checks happen to be written in.
+`shutdown(SHUT_RD)` on the connection wakes it just as well and needs no
+second fd, but it arrives looking exactly like a departed client, which is
+the one thing the watcher is there to recognise.
+
+The ordering on the way out is then fixed: close our end of the pair, join the
+watcher, and only then close the fds it was waiting on. The watcher never
+closes the connection itself either — the request thread still has a reply to
+attempt on it, and an fd freed early is one another thread can be handed
+before that reply is written.
+
+The rule is actually broader than the EOF, and deliberately so: **anything
+arriving on the connection ends the request.** The protocol is one request and
+one reply, so a client has already sent everything it will ever send by the
+time the check starts; bytes behind that are a client speaking a protocol this
+daemon does not have, and not one to go on working for. Being strict costs the
+*session* almost nothing now that abandoning a check keeps it — a false
+positive costs the two seconds the interrupt takes — but it is not free to the
+caller, and the difference is worth being honest about: a client still waiting
+would get its check abandoned and a reply saying it went away, which it did
+not. What makes that acceptable is that no client of this daemon writes
+anything after its request, so provoking it means speaking a protocol this one
+does not have, which the daemon logs by name. It is also the asymmetry that
+keeps the read: trusting `select` alone would put that same false positive
+within reach of a client doing nothing odd at all. Strictness rules out two
+worse shapes besides. Discarding the bytes instead would let a later
+second message on this connection, a pipelined request or an explicit cancel,
+be eaten in silence by the very thread that saw it; and a client that kept
+writing would keep the socket readable, so a watcher that consumed and carried
+on would spin on a core for as long as the client cared to talk.
+
+The read is still made, even though both outcomes mean the same thing, because
+it is what makes the readability real. `select` may in principle wake on
+nothing, and cancelling a check whose client is still waiting is the one false
+positive this must not produce; a read that would have blocked is the only way
+back into the wait.
+
+What the check does about it is what it already does behind an error: stop
+feeding, and SIGINT the running command once — and only once — the predicate
+above holds. The reuse is the point. The delicate part of interrupting Rocq is
+that predicate, and a second implementation of it with one clause relaxed
+would be a session that dies whenever the signal lands while it is formatting
+a goal. So an interrupt is slower to take effect than it could be, by about
+two seconds, in exchange for not being able to kill the thing it is trying to
+preserve.
+
+Then the session is left exactly as a failed sentence leaves it: Rocq
+backtracked to the last sentence that succeeded, the sentence map truncated to
+match, and `text` cut down to the prefix that really executed. The last of
+those is what makes an interrupt cheap rather than merely survivable — the
+next check sees a prefix and replays from the interrupted line — and it is
+also the one invariant an interrupt could quietly break, since a `text` that
+claims more than the sentence map covers makes the *next* check resume from a
+state Rocq is not in. Every way of stopping short therefore goes through one
+`_park_at`, rather than each writing those three assignments for itself.
+
+Two smaller consequences follow from there being nobody to answer. The `.vo`
+set the session loaded is still recorded, because an interrupted run has
+loaded whatever it loaded, and a session whose libraries are not written down
+is one that could later answer for a library that no longer exists. And
+`--compile` is not *started*: it is minutes of real compiling, and the request
+for it left with the client. One already running is left to finish, since it
+writes a `.vo` that a later check or a `make` can use and cancelling a compile
+deletes what it wrote; it holds no session and blocks nothing while it runs.
+
+The slot goes back into the table with its session in it, which is the
+difference a user sees — the file is checkable again in the couple of seconds
+the interrupt takes, rather than at the end of a proof nobody was waiting for.
+There is no verdict, and the exit code says so: 130, not 1. The question was
+withdrawn, not answered.
+
 ## Sessions
 
 One daemon per workspace, one `rocq repl` per `.v` file, each child in its own

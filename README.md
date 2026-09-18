@@ -81,7 +81,7 @@ rocq-warm stop                  # free the sessions
 Exit codes: 0 the file checks, 1 it does not, 2 it could not be checked (a
 stale dependency, the file is already being checked, no daemon, no `rocq`), 3 a
 green verdict that a real `rocq compile` then rejected -- a bug in rocq-warm,
-please report it.
+please report it, 130 interrupted with Ctrl+C, which is no verdict either.
 
 **One check per file at a time.** Different files check in parallel, which is
 the case that matters when several agents or terminals share a checkout. A
@@ -98,6 +98,39 @@ several GB spent answering one question, and the second would pay a full cold
 start; run one after the other, the second replays warm in no measurable time.
 So the retry is the cheap part, and waiting would only have handed you that
 same instant replay at the end of the wait.
+
+### Ctrl+C
+
+Interrupting a check stops the work, rather than leaving it running for
+nobody. The daemon notices that the client has gone, interrupts the sentence
+Rocq is on, and parks the session there:
+
+```console
+$ rocq-warm check proofs/Big.v
+^C
+rocq-warm: interrupted -- the warm session is being stopped at the line it reached, and kept; the next check of this file resumes from there
+
+$ rocq-warm check proofs/Big.v
+rocq-warm: proofs/Big.v OK [replay, 812/3671 sentences, 26.1s, 4.3 GB]
+```
+
+Exit code 130, the shell's own convention, and no verdict either way: an
+interrupted check did not answer the question. The `rocq repl` is **not**
+killed -- that is the whole point of interrupting it instead -- so it keeps
+the several GB and the minutes of state it had, and the next check replays
+from the line the interrupt stopped on.
+
+Killing the client any other way does the same thing, `kill -9` included: what
+the daemon acts on is the closed socket, not the signal. Nothing else is
+disturbed, either. The daemon runs detached in a session of its own, so a
+Ctrl+C in your terminal reaches the client and nothing beyond it, and checks
+of other files carry on.
+
+The one delay is the interrupt itself. A signal is only safe to send Rocq once
+a command has been running a couple of seconds without printing -- earlier
+than that it kills the process instead of interrupting it, which
+[DESIGN.md](DESIGN.md) goes into -- so for those seconds a check of the same
+file is still refused as busy.
 
 ### What it prints
 
@@ -172,6 +205,9 @@ verdict is reported and the session dropped; the
 falls out of the LRU under the session-count or memory budget; it goes
 untouched for the idle timeout; it exceeds its own RSS ceiling mid-check; or
 the check exceeds its wall timeout.
+
+A Ctrl+C is deliberately not on that list: an interrupted check keeps its
+session and parks it at the line it reached.
 The daemon exits once it has held nothing for the idle timeout, or as soon as
 its workspace directory disappears.
 
