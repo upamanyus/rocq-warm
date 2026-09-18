@@ -31,7 +31,7 @@ import threading
 import time
 import unittest
 
-from rocq_warm_helpers import (TOOLS, Workspace, alive, normalize,
+from rocq_warm_helpers import (TOOLS, Workspace, alive, cpu_seconds, normalize,
                                requires_rocq, requires_rocq_repl, wait_for)
 from rocqwarm import diag as diag_mod
 from rocqwarm import server as server_mod
@@ -485,15 +485,23 @@ class InterruptedCliTests(unittest.TestCase):
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE)
         self.addCleanup(client.kill)
-        # A couple of seconds into the check, which for this file is inside
-        # the spinning tactic: everything before it -- the cold start, two
-        # trivial sentences -- is milliseconds, and the tactic itself is tens
-        # of seconds.  `sentences` is asserted below, so an interrupt that
-        # landed too early fails loudly rather than passing vacuously.
-        self.assertTrue(
-            wait_for(lambda: (self.session_row().get("busy_for") or 0) > 2.0,
-                     timeout=180),
-            "the check never got going")
+        # The signal has to land inside the spinning tactic, and what says
+        # Rocq is in it is the CPU the child has burned -- not the clock.
+        # `busy_for` starts when the slot is borrowed, before there is a
+        # child at all, so on a loaded machine two seconds of it can be the
+        # cold start alone and the interrupt lands before a sentence has run.
+        # The work before the tactic does not get cheaper or dearer with load:
+        # startup is a quarter-second of CPU and the two sentences ahead of
+        # the tactic are noise, so a child that has burned seconds of it can
+        # only be in the tactic.  `sentences` is asserted below, so an
+        # interrupt that still landed too early fails loudly rather than
+        # passing vacuously.
+        def in_the_tactic():
+            pid = self.session_row().get("pid")
+            return pid is not None and (cpu_seconds(pid) or 0) > 2.0
+
+        self.assertTrue(wait_for(in_the_tactic, timeout=180),
+                        "the check never got into the spinning tactic")
         pid = self.session_row()["pid"]
 
         client.send_signal(signal.SIGINT)

@@ -115,6 +115,22 @@ def alive(pid):
         return False
 
 
+def cpu_seconds(pid):
+    """utime+stime, in seconds, or None if `pid` is gone.
+
+    What a test means by "Rocq is inside the tactic" and cannot say with a
+    clock: a loaded machine takes longer in wall-clock time to reach the same
+    point, but the work costs the same CPU either way.  `Session._cpu_ticks`
+    reads the same two fields for the same reason.
+    """
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def wait_for(pred, timeout=60, step=0.1):
     """Poll `pred` until it holds; returns whether it did in time."""
     deadline = time.time() + timeout
