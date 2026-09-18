@@ -125,10 +125,11 @@ class Session:
         self.text_being_fed = b""
         self._scan_pos = 0
         self._libmap = {}           # logical name -> .vo path, as Rocq reports it
-        # Nothing but the prologue has reached this child, so a cold check can
-        # use it as it stands instead of starting another.  False from the
-        # first sentence of the file onwards, whatever became of it.
-        self.virgin = False         # ... once there IS a child; see `start`
+        # True while this child has been started and fed nothing but the
+        # prologue, so a cold check can use it as it stands instead of
+        # starting another.  False from the moment the file itself is fed,
+        # whatever becomes of it.
+        self.fresh = False          # ... once there IS a child; see `start`
 
     # ---------------------------------------------------------------- process
 
@@ -156,7 +157,7 @@ class Session:
                     timeout=120, what="banner")
         self._trim_to_last_prompt()
         self._feed_raw(PROLOGUE, timeout=120)
-        self.virgin = True          # and until the file itself is fed
+        self.fresh = True           # nothing but the prologue, until a check
 
     def stop(self):
         if self.proc is None:
@@ -817,13 +818,14 @@ class Session:
             # empty, and this restarted it -- two spawns, and the pid written
             # between them named the one that was killed.
             #
-            # `virgin` and not "the map is empty", deliberately.  A map is
-            # also empty after a check that failed on its first sentence, and
-            # that child is NOT equivalent to a fresh one: a `Require` can
-            # fail with the library loaded anyway, which a cold `coqc` would
-            # not have. Reusing only an untouched child needs no such
-            # argument -- nothing but the prologue has reached it.
-            if not (self.alive and self.virgin):
+            # "Fed nothing but the prologue" rather than "the sentence map
+            # is empty", deliberately.  The map is also empty after a check
+            # that failed on its very first sentence, and that child is NOT
+            # equivalent to a new one: a `Require` can fail with the library
+            # loaded anyway, which a cold `coqc` would not have.  Reusing
+            # only a child that has never seen the file needs no argument
+            # about what Rocq kept.
+            if not (self.alive and self.fresh):
                 self.start()
             resume = 0
         else:
@@ -843,9 +845,10 @@ class Session:
             raise Abandoned("the client went away before the check started")
 
         # From here the child has seen the file, so it is no longer one a
-        # cold check may take as it finds.  Set before the feed rather than
-        # after: what disqualifies it is having been fed, not having finished.
-        self.virgin = False
+        # cold check may take as it finds.  Cleared before the feed rather
+        # than after: what disqualifies it is having been fed, not what the
+        # feed then did.
+        self.fresh = False
         try:
             items, base = self._feed_raw(text[resume:], timeout=timeout,
                                          stop_on_error=True,
