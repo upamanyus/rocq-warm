@@ -125,6 +125,10 @@ class Session:
         self.text_being_fed = b""
         self._scan_pos = 0
         self._libmap = {}           # logical name -> .vo path, as Rocq reports it
+        # Nothing but the prologue has reached this child, so a cold check can
+        # use it as it stands instead of starting another.  False from the
+        # first sentence of the file onwards, whatever became of it.
+        self.virgin = False         # ... once there IS a child; see `start`
 
     # ---------------------------------------------------------------- process
 
@@ -152,6 +156,7 @@ class Session:
                     timeout=120, what="banner")
         self._trim_to_last_prompt()
         self._feed_raw(PROLOGUE, timeout=120)
+        self.virgin = True          # and until the file itself is fed
 
     def stop(self):
         if self.proc is None:
@@ -804,7 +809,22 @@ class Session:
                                total=len(self.sentences))
 
         if mode == "cold":
-            self.start()
+            # A cold check needs a child that has run nothing, and one that
+            # has JUST BEEN STARTED already is one, so starting a second pays
+            # a `rocq repl` startup to arrive where we are.  That is what the
+            # first check of every file used to do: the slot starts the
+            # session, `plan` then says cold because the sentence map is
+            # empty, and this restarted it -- two spawns, and the pid written
+            # between them named the one that was killed.
+            #
+            # `virgin` and not "the map is empty", deliberately.  A map is
+            # also empty after a check that failed on its first sentence, and
+            # that child is NOT equivalent to a fresh one: a `Require` can
+            # fail with the library loaded anyway, which a cold `coqc` would
+            # not have. Reusing only an untouched child needs no such
+            # argument -- nothing but the prologue has reached it.
+            if not (self.alive and self.virgin):
+                self.start()
             resume = 0
         else:
             _, resume, state = plan
@@ -822,6 +842,10 @@ class Session:
             self._park_at(text[:resume])
             raise Abandoned("the client went away before the check started")
 
+        # From here the child has seen the file, so it is no longer one a
+        # cold check may take as it finds.  Set before the feed rather than
+        # after: what disqualifies it is having been fed, not having finished.
+        self.virgin = False
         try:
             items, base = self._feed_raw(text[resume:], timeout=timeout,
                                          stop_on_error=True,

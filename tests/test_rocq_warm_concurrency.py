@@ -475,6 +475,47 @@ class BookkeepingTests(ServerCase):
 
 
 @requires_rocq_repl
+class MidCheckBookkeepingTests(ServerCase):
+    """What the daemon has written down WHILE a check is running.
+
+    `BookkeepingTests` reads the pid file between checks, where it was always
+    right.  The window it exists for is the other one.
+    """
+
+    BODY = SPIN
+
+    def test_the_pid_file_names_the_child_while_the_check_runs(self):
+        """A cold check used to record a pid it had already killed.
+
+        The slot started a session, then `plan` said cold and `Session.start`
+        stopped that child and spawned another -- and the pid was written
+        between the two.  So for the whole of the slowest check a file ever
+        gets, its cold one, the file named a dead pid.  `reap_strays` skips a
+        pid with no `/proc` entry, so a daemon killed in that window left the
+        live child behind: several GB, blocked on a closed stdin, which is
+        exactly the case the file is kept for.
+
+        Asserted during the check rather than after, because after it the
+        double spawn was invisible -- the last write named the survivor.
+        """
+        thread, out = self.in_background()
+        self.wait_until_checking()
+        self.assertTrue(wait_for(lambda: self.recorded_pids()),
+                        "nothing was recorded while a check was running")
+
+        live = self.parked().live_pid()
+        self.assertEqual(self.recorded_pids(), [live],
+                         "the pid file does not name the running child")
+        self.assertTrue(alive(live), "it names a child that is not alive")
+        # And it was started once.  Two spawns is the bug above whether or
+        # not the file happens to name the survivor.
+        self.assertEqual(len(self.spawned), 1, self.spawned)
+
+        thread.join(timeout=300)
+        self.assertTrue(out["result"].get("passed"), out["result"])
+
+
+@requires_rocq_repl
 class EvictionTests(ServerCase):
     """More files in flight than session slots."""
 

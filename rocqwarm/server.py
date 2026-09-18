@@ -525,7 +525,11 @@ class Server:
             pre = {p: (m, sz) for p, m, sz in project.fingerprint(watched)}
             sess = slot.ready(flags, cwd, toolchain,
                               _session_ceiling(self.budget), pre)
-            self._record_sessions()     # there is a pid now, and not before
+            # There is a pid now, and not before -- and it is the pid that
+            # will still be running when the check ends, which is what makes
+            # writing it here right rather than merely early: a cold check
+            # reuses the child this started instead of replacing it.
+            self._record_sessions()
             try:
                 result = sess.check(text, timeout=timeout, cancelled=cancelled)
             except session_mod.Abandoned as e:
